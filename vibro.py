@@ -1,5 +1,6 @@
 import sys
 import re
+import struct
 import threading
 import time
 from collections import deque
@@ -12,13 +13,14 @@ from PyQt6.QtCore import QThread, pyqtSignal, QTimer
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QGridLayout,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton,
-    QVBoxLayout, QWidget
+    QSpinBox, QVBoxLayout, QWidget
 )
 import pyqtgraph as pg
 import pyqtgraph.exporters
 
 # === CONFIGURATION ===
 BAUD_RATE = 921600
+FC_BAUD_RATE = 115200
 FS = 800.0                       
 WINDOW_SECONDS = 2.0             
 BUFFER_SIZE = int(FS * WINDOW_SECONDS)
@@ -40,13 +42,13 @@ def find_preferred_port():
 
 
 class PortDialog(QDialog):
-    def __init__(self):
+    def __init__(self, title="Select ESP32 serial port", message=None, excluded_port=None):
         super().__init__()
-        self.setWindowTitle("Select ESP32 serial port")
+        self.setWindowTitle(title)
         self.setMinimumWidth(440)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("ESP32 port was not detected automatically. Select a connected COM port:"))
+        layout.addWidget(QLabel(message or "Select a connected COM port:"))
 
         self.port_combo = QComboBox()
         layout.addWidget(self.port_combo)
@@ -70,6 +72,8 @@ class PortDialog(QDialog):
         self.port_combo.blockSignals(True)
         self.port_combo.clear()
         for port in ports:
+            if port.device == excluded_port:
+                continue
             description = port.description or "Unknown device"
             self.port_combo.addItem(f"{port.device} - {description}", port.device)
 
@@ -150,6 +154,10 @@ class RealtimeVibeApp(QMainWindow):
         self.buf_y = deque(maxlen=BUFFER_SIZE)
         self.buf_z = deque(maxlen=BUFFER_SIZE)
         self.time_axes = ['X', 'Y', 'Z']
+        self.esp_port = serial_port
+        self.fc_serial = None
+        self.fc_port = None
+        self.esc_running = False
         self.process = psutil.Process()
         self.cpu_count = max(psutil.cpu_count() or 1, 1)
         self.cpu_history = deque(maxlen=10)
@@ -196,7 +204,36 @@ class RealtimeVibeApp(QMainWindow):
             statistics_layout.addWidget(peak_label, peak_number + 2, 0, 1, 3)
         self.cpu_stat_label = QLabel("CPU usage: 0%")
         statistics_layout.addWidget(self.cpu_stat_label, 5, 0, 1, 3)
-        main_layout.addWidget(statistics_box)
+
+        esc_box = QGroupBox("ESC control")
+        esc_layout = QVBoxLayout(esc_box)
+        self.fc_status_label = QLabel("FC: disconnected")
+        esc_layout.addWidget(self.fc_status_label)
+        self.btn_esc_start = QPushButton("START")
+        self.btn_esc_start.clicked.connect(self.start_esc)
+        esc_layout.addWidget(self.btn_esc_start)
+        self.btn_esc_stop = QPushButton("STOP")
+        self.btn_esc_stop.clicked.connect(self.stop_esc)
+        esc_layout.addWidget(self.btn_esc_stop)
+        power_layout = QHBoxLayout()
+        power_layout.addWidget(QLabel("Power level:"))
+        self.esc_power_input = QSpinBox()
+        self.esc_power_input.setRange(0, 100)
+        self.esc_power_input.setSuffix(" %")
+        self.esc_power_input.valueChanged.connect(self.update_esc_power)
+        power_layout.addWidget(self.esc_power_input)
+        esc_layout.addLayout(power_layout)
+        self.btn_reconnect_fc = QPushButton("Reconnect to FC")
+        self.btn_reconnect_fc.clicked.connect(self.reconnect_fc)
+        esc_layout.addWidget(self.btn_reconnect_fc)
+        esc_layout.addStretch()
+        statistics_box.setFixedHeight(180)
+        esc_box.setFixedHeight(180)
+
+        statistics_and_esc_layout = QHBoxLayout()
+        statistics_and_esc_layout.addWidget(statistics_box, 1)
+        statistics_and_esc_layout.addWidget(esc_box, 1)
+        main_layout.addLayout(statistics_and_esc_layout)
 
         pg.setConfigOptions(antialias=True, background='w', foreground='k')
         self.graphics_layout = pg.GraphicsLayoutWidget()
@@ -267,6 +304,71 @@ class RealtimeVibeApp(QMainWindow):
 
     def calibration_finished(self):
         self.btn_calibration.setEnabled(True)
+
+    def send_motor_values(self, motor_values):
+        if self.fc_serial is None or not self.fc_serial.is_open:
+            self.fc_status_label.setText("FC: disconnected")
+            return False
+
+        payload = b"".join(struct.pack("<H", value) for value in motor_values)
+        packet = b"$M<" + bytes((len(payload), 214)) + payload
+        checksum = 0
+        for byte in packet[3:]:
+            checksum ^= byte
+        try:
+            self.fc_serial.write(packet + bytes((checksum,)))
+            self.fc_serial.flush()
+            return True
+        except serial.SerialException as error:
+            self.fc_status_label.setText(f"FC error: {error}")
+            self.fc_serial.close()
+            self.fc_serial = None
+            self.fc_port = None
+            self.esc_running = False
+            return False
+
+    def start_esc(self):
+        if self.send_motor_values([1000 + self.esc_power_input.value() * 10, 1000, 1000, 1000]):
+            self.esc_running = True
+
+    def stop_esc(self):
+        if self.send_motor_values([1000, 1000, 1000, 1000]):
+            self.esc_running = False
+
+    def update_esc_power(self):
+        if self.esc_running:
+            self.start_esc()
+
+    def reconnect_fc(self):
+        if self.fc_serial is not None and self.fc_serial.is_open:
+            self.stop_esc()
+            self.fc_serial.close()
+            self.fc_serial = None
+            self.fc_port = None
+
+        dialog = PortDialog(
+            title="Select Betaflight FC serial port",
+            message="Select the COM port used by your Betaflight flight controller:",
+            excluded_port=self.esp_port,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        selected_port = dialog.selected_port()
+        try:
+            self.fc_serial = serial.Serial(selected_port, FC_BAUD_RATE, timeout=0.1)
+            self.fc_port = selected_port
+            self.fc_status_label.setText(f"FC: connected ({selected_port})")
+        except serial.SerialException as error:
+            self.fc_status_label.setText(f"FC connection failed: {error}")
+
+    def disconnect_fc(self):
+        if self.fc_serial is not None and self.fc_serial.is_open:
+            self.send_motor_values([1000, 1000, 1000, 1000])
+            self.fc_serial.close()
+        self.fc_serial = None
+        self.fc_port = None
+        self.esc_running = False
 
     def format_peak_statistics(self, peak_number, peaks):
         axis_values = []
@@ -359,6 +461,7 @@ class RealtimeVibeApp(QMainWindow):
         print(f"Snapshot saved to {filename}")
 
     def closeEvent(self, event):
+        self.disconnect_fc()
         self.serial_thread.stop()
         event.accept()
 
