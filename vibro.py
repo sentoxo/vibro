@@ -1,3 +1,5 @@
+# AI Generated code for real-time vibration monitoring and ESC control.
+
 import sys
 import re
 import struct
@@ -44,6 +46,7 @@ def find_preferred_port():
 class PortDialog(QDialog):
     def __init__(self, title="Select ESP32 serial port", message=None, excluded_port=None):
         super().__init__()
+        self.excluded_port = excluded_port
         self.setWindowTitle(title)
         self.setMinimumWidth(440)
 
@@ -72,7 +75,7 @@ class PortDialog(QDialog):
         self.port_combo.blockSignals(True)
         self.port_combo.clear()
         for port in ports:
-            if port.device == excluded_port:
+            if port.device == self.excluded_port:
                 continue
             description = port.description or "Unknown device"
             self.port_combo.addItem(f"{port.device} - {description}", port.device)
@@ -162,6 +165,7 @@ class RealtimeVibeApp(QMainWindow):
         self.cpu_count = max(psutil.cpu_count() or 1, 1)
         self.cpu_history = deque(maxlen=10)
         self.process.cpu_percent(None)
+        self.fc_diag_last_message = "FC not initialized"
 
         self.init_ui()
 
@@ -172,7 +176,7 @@ class RealtimeVibeApp(QMainWindow):
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_plots)
-        self.timer.start(50) 
+        self.timer.start(330) 
 
     def init_ui(self):
         main_widget = QWidget()
@@ -209,6 +213,8 @@ class RealtimeVibeApp(QMainWindow):
         esc_layout = QVBoxLayout(esc_box)
         self.fc_status_label = QLabel("FC: disconnected")
         esc_layout.addWidget(self.fc_status_label)
+        self.fc_diag_label = QLabel("FC diag: not initialized")
+        esc_layout.addWidget(self.fc_diag_label)
         self.btn_esc_start = QPushButton("START")
         self.btn_esc_start.clicked.connect(self.start_esc)
         esc_layout.addWidget(self.btn_esc_start)
@@ -305,8 +311,22 @@ class RealtimeVibeApp(QMainWindow):
     def calibration_finished(self):
         self.btn_calibration.setEnabled(True)
 
+    def log_fc_diagnostic(self, message, level="INFO"):
+        timestamp = time.strftime("%H:%M:%S")
+        text = f"[FC {timestamp}] {level}: {message}"
+        self.fc_diag_last_message = text
+        print(text, flush=True)
+        if hasattr(self, "fc_diag_label"):
+            self.fc_diag_label.setText(text)
+
     def send_motor_values(self, motor_values):
-        if self.fc_serial is None or not self.fc_serial.is_open:
+        if self.fc_serial is None:
+            self.log_fc_diagnostic("FC serial object is None; no connection was opened.", "ERROR")
+            self.fc_status_label.setText("FC: disconnected")
+            return False
+
+        if not self.fc_serial.is_open:
+            self.log_fc_diagnostic(f"FC serial port is closed; cannot send {motor_values}.", "ERROR")
             self.fc_status_label.setText("FC: disconnected")
             return False
 
@@ -315,11 +335,20 @@ class RealtimeVibeApp(QMainWindow):
         checksum = 0
         for byte in packet[3:]:
             checksum ^= byte
+        full_packet = packet + bytes((checksum,))
+
+        self.log_fc_diagnostic(
+            f"Sending ESC packet for channels={motor_values}, payload_len={len(payload)}, checksum=0x{checksum:02X}, bytes={full_packet.hex()}",
+            "INFO",
+        )
+
         try:
-            self.fc_serial.write(packet + bytes((checksum,)))
+            bytes_written = self.fc_serial.write(full_packet)
             self.fc_serial.flush()
+            self.log_fc_diagnostic(f"FC write succeeded: {bytes_written} bytes sent.", "OK")
             return True
         except serial.SerialException as error:
+            self.log_fc_diagnostic(f"FC write failed: {error}", "ERROR")
             self.fc_status_label.setText(f"FC error: {error}")
             self.fc_serial.close()
             self.fc_serial = None
@@ -328,12 +357,24 @@ class RealtimeVibeApp(QMainWindow):
             return False
 
     def start_esc(self):
-        if self.send_motor_values([1000 + self.esc_power_input.value() * 10, 1000, 1000, 1000]):
+        throttle = 1000 + self.esc_power_input.value() * 10
+        command = [throttle, throttle, throttle, throttle]
+        self.log_fc_diagnostic(f"start_esc() requested power={self.esc_power_input.value()}%, command={command}", "INFO")
+        if self.send_motor_values(command):
             self.esc_running = True
+            self.log_fc_diagnostic("ESC start command accepted by FC writer.", "OK")
+        else:
+            self.esc_running = False
+            self.log_fc_diagnostic("ESC start failed; FC is not connected or rejected the write.", "ERROR")
 
     def stop_esc(self):
-        if self.send_motor_values([1000, 1000, 1000, 1000]):
+        command = [1000, 1000, 1000, 1000]
+        self.log_fc_diagnostic(f"stop_esc() requested command={command}", "INFO")
+        if self.send_motor_values(command):
             self.esc_running = False
+            self.log_fc_diagnostic("ESC stop command sent.", "OK")
+        else:
+            self.log_fc_diagnostic("ESC stop command failed.", "ERROR")
 
     def update_esc_power(self):
         if self.esc_running:
@@ -352,23 +393,33 @@ class RealtimeVibeApp(QMainWindow):
             excluded_port=self.esp_port,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
+            self.log_fc_diagnostic("FC reconnect canceled by user.", "INFO")
             return
 
         selected_port = dialog.selected_port()
+        self.log_fc_diagnostic(
+            f"Attempting FC connection on {selected_port} at {FC_BAUD_RATE} baud.",
+            "INFO",
+        )
         try:
             self.fc_serial = serial.Serial(selected_port, FC_BAUD_RATE, timeout=0.1)
             self.fc_port = selected_port
             self.fc_status_label.setText(f"FC: connected ({selected_port})")
+            self.log_fc_diagnostic(f"FC connected successfully on {selected_port}.", "OK")
         except serial.SerialException as error:
             self.fc_status_label.setText(f"FC connection failed: {error}")
+            self.log_fc_diagnostic(f"FC connection failed on {selected_port}: {error}", "ERROR")
 
     def disconnect_fc(self):
+        self.log_fc_diagnostic("Disconnecting FC port and resetting ESC state.", "INFO")
         if self.fc_serial is not None and self.fc_serial.is_open:
             self.send_motor_values([1000, 1000, 1000, 1000])
             self.fc_serial.close()
         self.fc_serial = None
         self.fc_port = None
         self.esc_running = False
+        self.fc_status_label.setText("FC: disconnected")
+        self.log_fc_diagnostic("FC disconnected.", "OK")
 
     def format_peak_statistics(self, peak_number, peaks):
         axis_values = []
@@ -419,7 +470,7 @@ class RealtimeVibeApp(QMainWindow):
         self.average_stat_label.setText(
             f"Average vibration: {np.mean(np.abs(np.concatenate(data))):.1f} m/s²"
         )
-        cpu_usage = self.process.cpu_percent() / self.cpu_count
+        cpu_usage = self.process.cpu_percent() #/ self.cpu_count
         self.cpu_history.append(max(0.0, min(100.0, cpu_usage)))
         average_cpu_usage = np.mean(self.cpu_history)
         self.cpu_stat_label.setText(f"CPU usage: {average_cpu_usage:.0f}%")
