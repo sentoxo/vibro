@@ -11,11 +11,11 @@ import psutil
 import serial
 from serial.tools import list_ports
 
-from PyQt6.QtCore import QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import QThread, pyqtSignal, QTimer, Qt
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QGridLayout,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton,
-    QSpinBox, QVBoxLayout, QWidget
+    QVBoxLayout, QWidget
 )
 import pyqtgraph as pg
 import pyqtgraph.exporters
@@ -29,6 +29,8 @@ BUFFER_SIZE = int(FS * WINDOW_SECONDS)
 LSB_TO_MS2 = 0.0039 * 9.80665    
 FFT_Y_MAX = 7.0
 TIME_Y_MIN_RANGE = 2.0
+FFT_UPDATE_INTERVAL = 0.75
+MAX_FFT_POINTS = 512
 
 SEQ_LINE = re.compile(r"^S(\d),(\d+),(-?\d+),(-?\d+),(-?\d+)\s*$")
 PREFERRED_PORT_DESCRIPTION = "USB_SERIAL CH340"
@@ -102,49 +104,110 @@ class SerialWorker(QThread):
         self.port = port
         self.baudrate = baudrate
         self.running = True
+        self.ser = None
         self.calibration_requested = threading.Event()
 
     def run(self):
         try:
-            ser = serial.Serial(self.port, self.baudrate, timeout=0.1)
-            ser.write(b"call all\n")
+            self.ser = serial.Serial(self.port, self.baudrate, timeout=0.1)
+            self.ser.write(b"call all\n")
             time.sleep(3)
-            ser.write(b"start stream\n")
-            
+            self.ser.write(b"start stream\n")
+
             while self.running:
                 if self.calibration_requested.is_set():
-                    ser.write(b"stop stream\n")
+                    self.ser.write(b"stop stream\n")
                     time.sleep(1)
-                    ser.write(b"call all\n")
+                    self.ser.write(b"call all\n")
                     time.sleep(3)
-                    ser.write(b"start stream\n")
+                    self.ser.write(b"start stream\n")
                     self.calibration_requested.clear()
                     self.calibration_finished.emit()
 
-                line = ser.readline().decode("utf-8", errors="replace").strip()
+                line = self.ser.readline().decode("utf-8", errors="replace").strip()
                 if not line:
                     continue
                 match = SEQ_LINE.match(line)
                 if match:
                     sid, seq, raw_x, raw_y, raw_z = map(int, match.groups())
                     self.data_received.emit(
-                        sid, seq, 
-                        raw_x * LSB_TO_MS2, 
-                        raw_y * LSB_TO_MS2, 
-                        raw_z * LSB_TO_MS2
+                        sid, seq,
+                        raw_x * LSB_TO_MS2,
+                        raw_y * LSB_TO_MS2,
+                        raw_z * LSB_TO_MS2,
                     )
-            
-            ser.write(b"stop stream\n")
-            ser.close()
+
+            if self.ser and self.ser.is_open:
+                try:
+                    self.ser.write(b"stop stream\n")
+                except Exception:
+                    pass
+                self.ser.close()
         except Exception as e:
             print(f"Serial error: {e}")
 
     def stop(self):
         self.running = False
-        self.wait()
+        if self.ser and self.ser.is_open:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+        self.wait(2000)
 
     def request_calibration(self):
         self.calibration_requested.set()
+
+
+class FFTWorker(QThread):
+    result_ready = pyqtSignal(int, object, object)
+
+    def __init__(self):
+        super().__init__()
+        self.queue = deque()
+        self.lock = threading.Lock()
+
+    def submit(self, axis_index, signal_arr):
+        with self.lock:
+            self.queue.append((axis_index, signal_arr))
+
+    def run(self):
+        while not self.isInterruptionRequested():
+            item = None
+            with self.lock:
+                if self.queue:
+                    item = self.queue.popleft()
+
+            if item is None:
+                self.msleep(10)
+                continue
+
+            axis_index, signal_arr = item
+            freqs, amps = self.compute_fft(signal_arr)
+            self.result_ready.emit(axis_index, freqs, amps)
+
+    @staticmethod
+    def compute_fft(signal_arr):
+        arr = np.asarray(signal_arr, dtype=np.float64)
+        n = len(arr)
+        if n < 64:
+            return np.array([]), np.array([])
+
+        n = min(n, MAX_FFT_POINTS)
+        if len(arr) > n:
+            arr = arr[-n:]
+
+        sig = arr - np.mean(arr)
+        window = np.hanning(n)
+        scale = np.sum(window) / n
+
+        yf = np.fft.rfft(sig * window)
+        freqs = np.fft.rfftfreq(n, 1.0 / FS)
+        amp = (np.abs(yf) / n) / scale
+        if n > 1:
+            amp[1:-1] *= 2.0
+
+        return freqs, amp
 
 
 class RealtimeVibeApp(QMainWindow):
@@ -166,6 +229,11 @@ class RealtimeVibeApp(QMainWindow):
         self.cpu_history = deque(maxlen=10)
         self.process.cpu_percent(None)
         self.fc_diag_last_message = "FC not initialized"
+        self.fft_worker = FFTWorker()
+        self.fft_worker.result_ready.connect(self.handle_fft_result)
+        self.fft_worker.start()
+        self.fft_cache = [None, None, None]
+        self.last_fft_update = 0.0
 
         self.init_ui()
 
@@ -176,7 +244,7 @@ class RealtimeVibeApp(QMainWindow):
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_plots)
-        self.timer.start(330) 
+        self.timer.start(330) # FFT refresh
 
     def init_ui(self):
         main_widget = QWidget()
@@ -197,7 +265,12 @@ class RealtimeVibeApp(QMainWindow):
         main_layout.addLayout(control_layout)
 
         statistics_box = QGroupBox("Diagnostics")
+        statistics_box.setStyleSheet(
+            "QGroupBox { margin-top: 0px; padding-top: 8px; border: 1px solid #444; }"
+        )
         statistics_layout = QGridLayout(statistics_box)
+        statistics_layout.setContentsMargins(8, 12, 8, 8)
+        statistics_layout.setVerticalSpacing(4)
         self.average_stat_label = QLabel("Average vibration: 0.0 m/s²")
         statistics_layout.addWidget(self.average_stat_label, 0, 0, 1, 3)
         statistics_layout.addWidget(QLabel("Dominant FFT Peaks"), 1, 0, 1, 3)
@@ -208,33 +281,70 @@ class RealtimeVibeApp(QMainWindow):
             statistics_layout.addWidget(peak_label, peak_number + 2, 0, 1, 3)
         self.cpu_stat_label = QLabel("CPU usage: 0%")
         statistics_layout.addWidget(self.cpu_stat_label, 5, 0, 1, 3)
+        statistics_layout.addWidget(QLabel(""), 6, 0, 1, 3)
 
         esc_box = QGroupBox("ESC control")
+        esc_box.setStyleSheet(
+            "QGroupBox { margin-top: 0px; padding-top: 8px; border: 1px solid #444; }"
+        )
         esc_layout = QVBoxLayout(esc_box)
+        esc_layout.setContentsMargins(8, 12, 8, 8)
+        esc_layout.setSpacing(4)
         self.fc_status_label = QLabel("FC: disconnected")
         esc_layout.addWidget(self.fc_status_label)
         self.fc_diag_label = QLabel("FC diag: not initialized")
         esc_layout.addWidget(self.fc_diag_label)
         self.btn_esc_start = QPushButton("START")
+        self.btn_esc_start.setFixedWidth(170)
         self.btn_esc_start.clicked.connect(self.start_esc)
-        esc_layout.addWidget(self.btn_esc_start)
+        esc_layout.addWidget(self.btn_esc_start, alignment=Qt.AlignmentFlag.AlignLeft)
         self.btn_esc_stop = QPushButton("STOP")
+        self.btn_esc_stop.setFixedWidth(170)
         self.btn_esc_stop.clicked.connect(self.stop_esc)
-        esc_layout.addWidget(self.btn_esc_stop)
-        power_layout = QHBoxLayout()
-        power_layout.addWidget(QLabel("Power level:"))
-        self.esc_power_input = QSpinBox()
-        self.esc_power_input.setRange(0, 100)
-        self.esc_power_input.setSuffix(" %")
-        self.esc_power_input.valueChanged.connect(self.update_esc_power)
-        power_layout.addWidget(self.esc_power_input)
-        esc_layout.addLayout(power_layout)
+        esc_layout.addWidget(self.btn_esc_stop, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        power_label = QLabel("Power level:")
+        power_label.setFixedHeight(18)
+        power_label.setContentsMargins(0, 0, 0, 0)
+        power_label.setStyleSheet("QLabel { margin: 0px; padding: 0px; }")
+        esc_layout.addWidget(power_label, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        power_row_layout = QHBoxLayout()
+        power_row_layout.setContentsMargins(0, 0, 0, 0)
+        power_row_layout.setSpacing(6)
+
+        self.esc_power_input = QLineEdit("0 %")
+        self.esc_power_input.setFixedWidth(58)
+        self.esc_power_input.setFixedHeight(24)
+        self.esc_power_input.setReadOnly(True)
+        self.esc_power_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.esc_power_input.setStyleSheet(
+            "QLineEdit { margin: 0px; padding: 0px; border: 1px solid #666666; }"
+        )
+        power_row_layout.addWidget(self.esc_power_input, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        self.btn_power_minus = QPushButton("-10%")
+        self.btn_power_minus.setFixedWidth(64)
+        self.btn_power_minus.setFixedHeight(24)
+        self.btn_power_minus.clicked.connect(lambda: self.adjust_esc_power(-10))
+        power_row_layout.addWidget(self.btn_power_minus, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        self.btn_power_plus = QPushButton("+10%")
+        self.btn_power_plus.setFixedWidth(64)
+        self.btn_power_plus.setFixedHeight(24)
+        self.btn_power_plus.clicked.connect(lambda: self.adjust_esc_power(10))
+        power_row_layout.addWidget(self.btn_power_plus, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        power_row_layout.addStretch(1)
+        esc_layout.addLayout(power_row_layout)
+
         self.btn_reconnect_fc = QPushButton("Reconnect to FC")
+        self.btn_reconnect_fc.setFixedWidth(170)
         self.btn_reconnect_fc.clicked.connect(self.reconnect_fc)
-        esc_layout.addWidget(self.btn_reconnect_fc)
-        esc_layout.addStretch()
-        statistics_box.setFixedHeight(180)
-        esc_box.setFixedHeight(180)
+        esc_layout.addWidget(self.btn_reconnect_fc, alignment=Qt.AlignmentFlag.AlignLeft)
+        statistics_box.setFixedHeight(200)
+        esc_box.setFixedHeight(200)
+        esc_box.setFixedWidth(360)
 
         statistics_and_esc_layout = QHBoxLayout()
         statistics_and_esc_layout.addWidget(statistics_box, 1)
@@ -357,9 +467,10 @@ class RealtimeVibeApp(QMainWindow):
             return False
 
     def start_esc(self):
-        throttle = 1000 + self.esc_power_input.value() * 10
+        power_value = self.get_esc_power_value()
+        throttle = 1000 + power_value * 10
         command = [throttle, throttle, throttle, throttle]
-        self.log_fc_diagnostic(f"start_esc() requested power={self.esc_power_input.value()}%, command={command}", "INFO")
+        self.log_fc_diagnostic(f"start_esc() requested power={power_value}%, command={command}", "INFO")
         if self.send_motor_values(command):
             self.esc_running = True
             self.log_fc_diagnostic("ESC start command accepted by FC writer.", "OK")
@@ -376,7 +487,23 @@ class RealtimeVibeApp(QMainWindow):
         else:
             self.log_fc_diagnostic("ESC stop command failed.", "ERROR")
 
+    def get_esc_power_value(self):
+        try:
+            return max(0, min(100, int(self.esc_power_input.text().replace("%", "").strip())))
+        except ValueError:
+            return 0
+
+    def set_esc_power_value(self, value):
+        new_value = max(0, min(100, int(value)))
+        self.esc_power_input.setText(f"{new_value} %")
+
     def update_esc_power(self):
+        if self.esc_running:
+            self.start_esc()
+
+    def adjust_esc_power(self, delta):
+        new_value = max(0, min(100, self.get_esc_power_value() + delta))
+        self.set_esc_power_value(new_value)
         if self.esc_running:
             self.start_esc()
 
@@ -442,23 +569,25 @@ class RealtimeVibeApp(QMainWindow):
             (frequencies[index], amplitudes[index]) for index in peak_indices
         ]
 
-    def compute_fft(self, signal_arr):
-        n = len(signal_arr)
-        if n < 64:
-            return np.array([]), np.array([])
-        
-        sig = signal_arr - np.mean(signal_arr)
-        window = np.hanning(n)
-        scale = np.sum(window) / n
-        
-        yf = np.fft.rfft(sig * window)
-        freqs = np.fft.rfftfreq(n, 1.0 / FS)
-        
-        amp = (np.abs(yf) / n) / scale
-        if n > 1:
-            amp[1:-1] *= 2.0
-            
-        return freqs, amp
+    def handle_fft_result(self, axis_index, freqs, amps):
+        self.fft_cache[axis_index] = (freqs, amps)
+        if len(freqs) > 0:
+            self.curves_fft[axis_index].setData(freqs, amps)
+
+        fft_peaks = []
+        for axis_idx in range(3):
+            data = self.fft_cache[axis_idx]
+            if data is None:
+                fft_peaks.append([])
+            else:
+                freqs, amps = data
+                if len(freqs) > 0:
+                    fft_peaks.append(self.find_fft_peaks(freqs, amps))
+                else:
+                    fft_peaks.append([])
+
+        for peak_number, peak_label in enumerate(self.peak_stat_labels):
+            peak_label.setText(self.format_peak_statistics(peak_number, fft_peaks))
 
     def update_plots(self):
         if len(self.buf_x) < 64:
@@ -466,7 +595,6 @@ class RealtimeVibeApp(QMainWindow):
 
         data = [np.array(self.buf_x), np.array(self.buf_y), np.array(self.buf_z)]
         t = np.arange(len(data[0])) / FS
-        fft_peaks = []
         self.average_stat_label.setText(
             f"Average vibration: {np.mean(np.abs(np.concatenate(data))):.1f} m/s²"
         )
@@ -476,7 +604,6 @@ class RealtimeVibeApp(QMainWindow):
         self.cpu_stat_label.setText(f"CPU usage: {average_cpu_usage:.0f}%")
 
         for i in range(3):
-            # Update Time
             self.curves_time[i].setData(t, data[i])
             time_y_limit = max(
                 TIME_Y_MIN_RANGE / 2,
@@ -487,17 +614,28 @@ class RealtimeVibeApp(QMainWindow):
             self.plots_time[i].setTitle(
                 f"Czasówki - Oś {self.time_axes[i]} - {average_level:.1f} m/s² avg"
             )
-            
-            # Update FFT
-            f, a = self.compute_fft(data[i])
-            if len(f) > 0:
-                self.curves_fft[i].setData(f, a)
-                fft_peaks.append(self.find_fft_peaks(f, a))
-            else:
-                fft_peaks.append([])
 
+        now = time.perf_counter()
+        if now - self.last_fft_update >= FFT_UPDATE_INTERVAL:
+            self.last_fft_update = now
+            for i in range(3):
+                self.fft_worker.submit(i, data[i])
+
+    def calibrate(self):
+        self.buf_x.clear()
+        self.buf_y.clear()
+        self.buf_z.clear()
+        self.fft_cache = [None, None, None]
+        for curve in self.curves_time + self.curves_fft:
+            curve.setData([], [])
+        for i, axis in enumerate(self.time_axes):
+            self.plots_time[i].setTitle(f"Czasówki - Oś {axis} - 0.0 m/s² avg")
+        self.average_stat_label.setText("Average vibration: 0.0 m/s²")
         for peak_number, peak_label in enumerate(self.peak_stat_labels):
-            peak_label.setText(self.format_peak_statistics(peak_number, fft_peaks))
+            peak_label.setText(self.format_peak_statistics(peak_number, [[], [], []]))
+        self.cpu_stat_label.setText("CPU usage: 0%")
+        self.btn_calibration.setEnabled(False)
+        self.serial_thread.request_calibration()
 
     def save_png(self):
         filename = self.filename_input.text().strip()
@@ -512,8 +650,17 @@ class RealtimeVibeApp(QMainWindow):
         print(f"Snapshot saved to {filename}")
 
     def closeEvent(self, event):
+        self.timer.stop()
         self.disconnect_fc()
-        self.serial_thread.stop()
+
+        if hasattr(self, "serial_thread"):
+            self.serial_thread.stop()
+
+        if hasattr(self, "fft_worker"):
+            self.fft_worker.requestInterruption()
+            self.fft_worker.quit()
+            self.fft_worker.wait(1000)
+
         event.accept()
 
 if __name__ == "__main__":
