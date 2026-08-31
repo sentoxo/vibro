@@ -1,5 +1,6 @@
 # AI Generated code for real-time vibration monitoring and ESC control.
 
+import os
 import sys
 import re
 import struct
@@ -13,9 +14,9 @@ from serial.tools import list_ports
 
 from PyQt6.QtCore import QThread, pyqtSignal, QTimer, Qt
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QDialogButtonBox, QGridLayout,
-    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton,
-    QVBoxLayout, QWidget
+    QApplication, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
+    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+    QPushButton, QSpinBox, QVBoxLayout, QWidget
 )
 import pyqtgraph as pg
 import pyqtgraph.exporters
@@ -29,7 +30,8 @@ BUFFER_SIZE = int(FS * WINDOW_SECONDS)
 LSB_TO_MS2 = 0.0039 * 9.80665    
 FFT_Y_MAX = 7.0
 TIME_Y_MIN_RANGE = 2.0
-FFT_UPDATE_INTERVAL = 0.75
+DEFAULT_FFT_REFRESH_HZ = 5.0
+FFT_UPDATE_INTERVAL = 1.0 / DEFAULT_FFT_REFRESH_HZ
 MAX_FFT_POINTS = 512
 
 SEQ_LINE = re.compile(r"^S(\d),(\d+),(-?\d+),(-?\d+),(-?\d+)\s*$")
@@ -234,6 +236,8 @@ class RealtimeVibeApp(QMainWindow):
         self.fft_worker.start()
         self.fft_cache = [None, None, None]
         self.last_fft_update = 0.0
+        self.fft_refresh_hz = DEFAULT_FFT_REFRESH_HZ
+        self.fft_update_interval = FFT_UPDATE_INTERVAL
 
         self.init_ui()
 
@@ -244,25 +248,13 @@ class RealtimeVibeApp(QMainWindow):
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_plots)
-        self.timer.start(330) # FFT refresh
+        self.set_fft_refresh_rate(self.fft_refresh_hz)
+        self.timer.start(int(1000.0 / self.fft_refresh_hz))
 
     def init_ui(self):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         main_layout = QVBoxLayout(main_widget)
-
-        control_layout = QHBoxLayout()
-        self.filename_input = QLineEdit()
-        self.filename_input.setPlaceholderText("PNG file name")
-        self.filename_input.setFixedWidth(300)
-        control_layout.addWidget(self.filename_input)
-        self.btn_save = QPushButton("Save PNG Snapshot")
-        self.btn_save.clicked.connect(self.save_png)
-        control_layout.addWidget(self.btn_save)
-        self.btn_calibration = QPushButton("Calibration")
-        self.btn_calibration.clicked.connect(self.calibrate)
-        control_layout.addWidget(self.btn_calibration)
-        main_layout.addLayout(control_layout)
 
         statistics_box = QGroupBox("Diagnostics")
         statistics_box.setStyleSheet(
@@ -282,6 +274,57 @@ class RealtimeVibeApp(QMainWindow):
         self.cpu_stat_label = QLabel("CPU usage: 0%")
         statistics_layout.addWidget(self.cpu_stat_label, 5, 0, 1, 3)
         statistics_layout.addWidget(QLabel(""), 6, 0, 1, 3)
+
+        settings_box = QGroupBox("Settings")
+        settings_box.setStyleSheet(
+            "QGroupBox { margin-top: 0px; padding-top: 8px; border: 1px solid #444; }"
+        )
+        settings_layout = QVBoxLayout(settings_box)
+        settings_layout.setContentsMargins(8, 12, 8, 8)
+        settings_layout.setSpacing(6)
+
+        self.btn_calibration = QPushButton("Calibration")
+        self.btn_calibration.clicked.connect(self.calibrate)
+        self.btn_calibration.setFixedWidth(200)
+        settings_layout.addWidget(self.btn_calibration)
+
+        refresh_label = QLabel("FFT refresh speed:")
+        settings_layout.addWidget(refresh_label)
+
+        self.fft_refresh_input = QDoubleSpinBox()
+        self.fft_refresh_input.setRange(1.0, 30.0)
+        self.fft_refresh_input.setDecimals(1)
+        self.fft_refresh_input.setSingleStep(0.5)
+        self.fft_refresh_input.setSuffix(" Hz")
+        self.fft_refresh_input.setValue(self.fft_refresh_hz)
+        self.fft_refresh_input.valueChanged.connect(self.set_fft_refresh_rate)
+        settings_layout.addWidget(self.fft_refresh_input)
+
+        settings_layout.addStretch(1)
+        settings_box.setFixedHeight(200)
+        settings_box.setFixedWidth(220)
+
+        action_box = QGroupBox("File")
+        action_box.setStyleSheet(
+            "QGroupBox { margin-top: 0px; padding-top: 8px; border: 1px solid #444; }"
+        )
+        action_layout = QVBoxLayout(action_box)
+        action_layout.setContentsMargins(8, 12, 8, 8)
+        action_layout.setSpacing(6)
+
+        self.filename_input = QLineEdit()
+        self.filename_input.setPlaceholderText("PNG file name")
+        self.filename_input.setFixedWidth(220)
+        action_layout.addWidget(self.filename_input)
+
+        self.btn_save = QPushButton("Save PNG Snapshot")
+        self.btn_save.clicked.connect(self.save_png)
+        self.btn_save.setFixedWidth(220)
+        action_layout.addWidget(self.btn_save)
+
+        action_layout.addStretch(1)
+        action_box.setFixedHeight(200)
+        action_box.setFixedWidth(260)
 
         esc_box = QGroupBox("ESC control")
         esc_box.setStyleSheet(
@@ -313,14 +356,15 @@ class RealtimeVibeApp(QMainWindow):
         power_row_layout.setContentsMargins(0, 0, 0, 0)
         power_row_layout.setSpacing(6)
 
-        self.esc_power_input = QLineEdit("0 %")
-        self.esc_power_input.setFixedWidth(58)
+        self.esc_power_input = QSpinBox()
+        self.esc_power_input.setRange(0, 100)
+        self.esc_power_input.setSingleStep(1)
+        self.esc_power_input.setSuffix(" %")
+        self.esc_power_input.setValue(0)
+        self.esc_power_input.setFixedWidth(78)
         self.esc_power_input.setFixedHeight(24)
-        self.esc_power_input.setReadOnly(True)
         self.esc_power_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.esc_power_input.setStyleSheet(
-            "QLineEdit { margin: 0px; padding: 0px; border: 1px solid #666666; }"
-        )
+        self.esc_power_input.valueChanged.connect(self.update_esc_power)
         power_row_layout.addWidget(self.esc_power_input, alignment=Qt.AlignmentFlag.AlignLeft)
 
         self.btn_power_minus = QPushButton("-10%")
@@ -343,11 +387,15 @@ class RealtimeVibeApp(QMainWindow):
         self.btn_reconnect_fc.clicked.connect(self.reconnect_fc)
         esc_layout.addWidget(self.btn_reconnect_fc, alignment=Qt.AlignmentFlag.AlignLeft)
         statistics_box.setFixedHeight(200)
+        settings_box.setFixedHeight(200)
+        action_box.setFixedHeight(200)
         esc_box.setFixedHeight(200)
         esc_box.setFixedWidth(360)
 
         statistics_and_esc_layout = QHBoxLayout()
         statistics_and_esc_layout.addWidget(statistics_box, 1)
+        statistics_and_esc_layout.addWidget(settings_box, 0)
+        statistics_and_esc_layout.addWidget(action_box, 0)
         statistics_and_esc_layout.addWidget(esc_box, 1)
         main_layout.addLayout(statistics_and_esc_layout)
 
@@ -467,6 +515,7 @@ class RealtimeVibeApp(QMainWindow):
             return False
 
     def start_esc(self):
+        self._stop_ramp_active = False
         power_value = self.get_esc_power_value()
         throttle = 1000 + power_value * 10
         command = [throttle, throttle, throttle, throttle]
@@ -478,24 +527,53 @@ class RealtimeVibeApp(QMainWindow):
             self.esc_running = False
             self.log_fc_diagnostic("ESC start failed; FC is not connected or rejected the write.", "ERROR")
 
-    def stop_esc(self):
-        command = [1000, 1000, 1000, 1000]
-        self.log_fc_diagnostic(f"stop_esc() requested command={command}", "INFO")
-        if self.send_motor_values(command):
+    def _run_esc_stop_ramp(self, power_value):
+        if not getattr(self, "_stop_ramp_active", False):
+            return
+
+        if power_value <= 0:
+            command = [1000, 1000, 1000, 1000]
+            self.send_motor_values(command)
+            self.set_esc_power_value(0)
             self.esc_running = False
-            self.log_fc_diagnostic("ESC stop command sent.", "OK")
-        else:
-            self.log_fc_diagnostic("ESC stop command failed.", "ERROR")
+            self._stop_ramp_active = False
+            self.log_fc_diagnostic("ESC stop ramp completed; motors are at zero throttle.", "OK")
+            return
+
+        throttle = 1000 + power_value * 10
+        command = [throttle, throttle, throttle, throttle]
+        self.send_motor_values(command)
+        self.set_esc_power_value(power_value)
+        self.log_fc_diagnostic(f"ESC stop ramp: {power_value}% for 50 ms.", "INFO")
+        QTimer.singleShot(50, lambda: self._run_esc_stop_ramp(power_value - 5))
+
+    def stop_esc(self):
+        if self.fc_serial is None or not self.fc_serial.is_open:
+            self.log_fc_diagnostic("ESC stop requested, but FC is not connected.", "ERROR")
+            return
+
+        self._stop_ramp_active = True
+        current_power = max(0, min(100, self.get_esc_power_value()))
+        self.log_fc_diagnostic(f"stop_esc() started smooth ramp from {current_power}% down to 0%.", "INFO")
+        self._run_esc_stop_ramp(current_power)
 
     def get_esc_power_value(self):
-        try:
-            return max(0, min(100, int(self.esc_power_input.text().replace("%", "").strip())))
-        except ValueError:
-            return 0
+        return max(0, min(100, int(self.esc_power_input.value())))
 
     def set_esc_power_value(self, value):
         new_value = max(0, min(100, int(value)))
-        self.esc_power_input.setText(f"{new_value} %")
+        self.esc_power_input.setValue(new_value)
+
+    def set_fft_refresh_rate(self, hz_value):
+        value = max(1.0, float(hz_value))
+        self.fft_refresh_hz = value
+        self.fft_update_interval = 1.0 / self.fft_refresh_hz
+        if hasattr(self, "timer"):
+            self.timer.setInterval(int(max(50, 1000.0 / self.fft_refresh_hz)))
+        if hasattr(self, "fft_refresh_input") and abs(self.fft_refresh_input.value() - self.fft_refresh_hz) > 1e-9:
+            self.fft_refresh_input.blockSignals(True)
+            self.fft_refresh_input.setValue(self.fft_refresh_hz)
+            self.fft_refresh_input.blockSignals(False)
 
     def update_esc_power(self):
         if self.esc_running:
@@ -616,7 +694,7 @@ class RealtimeVibeApp(QMainWindow):
             )
 
         now = time.perf_counter()
-        if now - self.last_fft_update >= FFT_UPDATE_INTERVAL:
+        if now - self.last_fft_update >= self.fft_update_interval:
             self.last_fft_update = now
             for i in range(3):
                 self.fft_worker.submit(i, data[i])
@@ -638,12 +716,28 @@ class RealtimeVibeApp(QMainWindow):
         self.serial_thread.request_calibration()
 
     def save_png(self):
+        log_dir = os.path.join(os.getcwd(), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+
         filename = self.filename_input.text().strip()
         if not filename:
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             filename = f"Realtime_Snapshot_{timestamp}.png"
         elif not filename.lower().endswith(".png"):
             filename += ".png"
+
+        filename = os.path.join(log_dir, filename)
+
+        if os.path.exists(filename):
+            base_name, ext = os.path.splitext(filename)
+            counter = 2
+            while True:
+                new_name = f"{base_name}_{counter:02d}{ext}"
+                if not os.path.exists(new_name):
+                    filename = new_name
+                    break
+                counter += 1
+
         exporter = pg.exporters.ImageExporter(self.graphics_layout.scene())
         exporter.parameters()['width'] = 1920
         exporter.export(filename)
