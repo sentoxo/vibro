@@ -19,7 +19,6 @@ from PyQt6.QtWidgets import (
     QPushButton, QSpinBox, QVBoxLayout, QWidget
 )
 import pyqtgraph as pg
-import pyqtgraph.exporters
 
 # === CONFIGURATION ===
 BAUD_RATE = 921600
@@ -119,9 +118,9 @@ class SerialWorker(QThread):
             while self.running:
                 if self.calibration_requested.is_set():
                     self.ser.write(b"stop stream\n")
-                    time.sleep(1)
+                    time.sleep(1.5)
                     self.ser.write(b"call all\n")
-                    time.sleep(3)
+                    time.sleep(2.5)
                     self.ser.write(b"start stream\n")
                     self.calibration_requested.clear()
                     self.calibration_finished.emit()
@@ -159,6 +158,79 @@ class SerialWorker(QThread):
 
     def request_calibration(self):
         self.calibration_requested.set()
+
+
+class FCTelemetryReader(QThread):
+    rpm_updated = pyqtSignal(float)
+
+    def __init__(self, serial_port):
+        super().__init__()
+        self.ser = serial_port
+        self.running = True
+        self.buffer = ""
+
+    @staticmethod
+    def _parse_rpm_from_line(line):
+        text = line.strip()
+        if not text:
+            return None
+
+        patterns = [
+            re.compile(r"(?:rpm|rmp|r/min)\s*[:=]?\s*(\d+(?:\.\d+)?)", re.IGNORECASE),
+            re.compile(r"(\d+(?:\.\d+)?)\s*(?:rpm|rmp|r/min)", re.IGNORECASE),
+            re.compile(r"(?:m[1-4]|motor[1-4])\s*[:=]?\s*(\d+(?:\.\d+)?)", re.IGNORECASE),
+            re.compile(r"(\d+(?:\.\d+)?)\s*hz", re.IGNORECASE),
+            re.compile(r"(?:hz)\s*[:=]?\s*(\d+(?:\.\d+)?)", re.IGNORECASE),
+        ]
+
+        values = []
+        for pattern in patterns:
+            for match in pattern.finditer(text):
+                values.append(float(match.group(1)))
+
+        if not values:
+            return None
+
+        if len(values) > 1:
+            return sum(values) / len(values)
+        return values[0]
+
+    def run(self):
+        while self.running and self.ser and self.ser.is_open:
+            try:
+                if self.ser.in_waiting <= 0:
+                    self.msleep(20)
+                    continue
+
+                chunk = self.ser.read(self.ser.in_waiting)
+                if not chunk:
+                    continue
+
+                self.buffer += chunk.decode("utf-8", errors="replace")
+                while True:
+                    newline_index = self.buffer.find("\n")
+                    carriage_index = self.buffer.find("\r")
+                    split_index = min(
+                        index for index in [newline_index, carriage_index] if index != -1
+                    ) if (newline_index != -1 or carriage_index != -1) else -1
+
+                    if split_index == -1:
+                        break
+
+                    line = self.buffer[:split_index].strip()
+                    self.buffer = self.buffer[split_index + 1:]
+                    if not line:
+                        continue
+
+                    rpm_value = self._parse_rpm_from_line(line)
+                    if rpm_value is not None:
+                        self.rpm_updated.emit(float(rpm_value))
+            except Exception:
+                self.msleep(50)
+
+    def stop(self):
+        self.running = False
+        self.wait(500)
 
 
 class FFTWorker(QThread):
@@ -218,9 +290,10 @@ class RealtimeVibeApp(QMainWindow):
         self.setWindowTitle("VibroApp")
         self.resize(1600, 900)
 
-        self.buf_x = deque(maxlen=BUFFER_SIZE)
-        self.buf_y = deque(maxlen=BUFFER_SIZE)
-        self.buf_z = deque(maxlen=BUFFER_SIZE)
+        self.time_window_seconds = 2.0
+        self.buf_x = deque(maxlen=int(FS * self.time_window_seconds))
+        self.buf_y = deque(maxlen=int(FS * self.time_window_seconds))
+        self.buf_z = deque(maxlen=int(FS * self.time_window_seconds))
         self.time_axes = ['X', 'Y', 'Z']
         self.esp_port = serial_port
         self.fc_serial = None
@@ -231,6 +304,8 @@ class RealtimeVibeApp(QMainWindow):
         self.cpu_history = deque(maxlen=10)
         self.process.cpu_percent(None)
         self.fc_diag_last_message = "FC not initialized"
+        self.fc_rpm = 0.0
+        self.fc_telemetry_thread = None
         self.fft_worker = FFTWorker()
         self.fft_worker.result_ready.connect(self.handle_fft_result)
         self.fft_worker.start()
@@ -249,6 +324,7 @@ class RealtimeVibeApp(QMainWindow):
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_plots)
         self.set_fft_refresh_rate(self.fft_refresh_hz)
+        self.set_time_zoom(False)
         self.timer.start(int(1000.0 / self.fft_refresh_hz))
 
     def init_ui(self):
@@ -271,9 +347,17 @@ class RealtimeVibeApp(QMainWindow):
             peak_label = QLabel(self.format_peak_statistics(peak_number, [[], [], []]))
             self.peak_stat_labels.append(peak_label)
             statistics_layout.addWidget(peak_label, peak_number + 2, 0, 1, 3)
+        self.rpm_label = QLabel("Motor RPM: --")
+        self.rpm_label.setStyleSheet("QLabel { font-weight: 600; }")
+        statistics_layout.addWidget(self.rpm_label, 5, 0, 1, 3)
+
+        self.rpm_hz_label = QLabel("Motor Hz: --")
+        self.rpm_hz_label.setStyleSheet("QLabel { font-weight: 600; }")
+        statistics_layout.addWidget(self.rpm_hz_label, 6, 0, 1, 3)
+
         self.cpu_stat_label = QLabel("CPU usage: 0%")
-        statistics_layout.addWidget(self.cpu_stat_label, 5, 0, 1, 3)
-        statistics_layout.addWidget(QLabel(""), 6, 0, 1, 3)
+        statistics_layout.addWidget(self.cpu_stat_label, 7, 0, 1, 3)
+        statistics_layout.addWidget(QLabel(""), 8, 0, 1, 3)
 
         settings_box = QGroupBox("Settings")
         settings_box.setStyleSheet(
@@ -287,6 +371,17 @@ class RealtimeVibeApp(QMainWindow):
         self.btn_calibration.clicked.connect(self.calibrate)
         self.btn_calibration.setFixedWidth(200)
         settings_layout.addWidget(self.btn_calibration)
+
+        self.btn_reconnect_esp = QPushButton("Reconnect to esp")
+        self.btn_reconnect_esp.clicked.connect(self.reconnect_esp)
+        self.btn_reconnect_esp.setFixedWidth(200)
+        settings_layout.addWidget(self.btn_reconnect_esp)
+
+        self.btn_zoom_timescale = QPushButton("Zoom")
+        self.btn_zoom_timescale.setCheckable(True)
+        self.btn_zoom_timescale.setFixedWidth(200)
+        self.btn_zoom_timescale.clicked.connect(self.toggle_time_zoom)
+        settings_layout.addWidget(self.btn_zoom_timescale)
 
         refresh_label = QLabel("FFT refresh speed:")
         settings_layout.addWidget(refresh_label)
@@ -317,10 +412,22 @@ class RealtimeVibeApp(QMainWindow):
         self.filename_input.setFixedWidth(220)
         action_layout.addWidget(self.filename_input)
 
+        self.filename_index_input = QSpinBox()
+        self.filename_index_input.setRange(1, 99)
+        self.filename_index_input.setValue(1)
+        self.filename_index_input.setFixedWidth(220)
+        action_layout.addWidget(self.filename_index_input)
+
         self.btn_save = QPushButton("Save PNG Snapshot")
         self.btn_save.clicked.connect(self.save_png)
         self.btn_save.setFixedWidth(220)
         action_layout.addWidget(self.btn_save)
+
+        self.save_status_label = QLabel("")
+        self.save_status_label.setWordWrap(True)
+        self.save_status_label.setStyleSheet("QLabel { color: #2d6b2d; font-size: 12px; }")
+        self.save_status_label.setFixedWidth(220)
+        action_layout.addWidget(self.save_status_label)
 
         action_layout.addStretch(1)
         action_box.setFixedHeight(200)
@@ -356,25 +463,38 @@ class RealtimeVibeApp(QMainWindow):
         power_row_layout.setContentsMargins(0, 0, 0, 0)
         power_row_layout.setSpacing(6)
 
-        self.esc_power_input = QSpinBox()
-        self.esc_power_input.setRange(0, 100)
-        self.esc_power_input.setSingleStep(1)
+        self.esc_power_input = QDoubleSpinBox()
+        self.esc_power_input.setRange(0.0, 100.0)
+        self.esc_power_input.setDecimals(1)
+        self.esc_power_input.setSingleStep(0.1)
         self.esc_power_input.setSuffix(" %")
-        self.esc_power_input.setValue(0)
-        self.esc_power_input.setFixedWidth(78)
+        self.esc_power_input.setValue(0.0)
+        self.esc_power_input.setFixedWidth(95)
         self.esc_power_input.setFixedHeight(24)
         self.esc_power_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.esc_power_input.valueChanged.connect(self.update_esc_power)
         power_row_layout.addWidget(self.esc_power_input, alignment=Qt.AlignmentFlag.AlignLeft)
 
+        self.btn_power_minus_01 = QPushButton("-1%")
+        self.btn_power_minus_01.setFixedWidth(50)
+        self.btn_power_minus_01.setFixedHeight(24)
+        self.btn_power_minus_01.clicked.connect(lambda: self.adjust_esc_power(-1))
+        power_row_layout.addWidget(self.btn_power_minus_01, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        self.btn_power_plus_01 = QPushButton("+1%")
+        self.btn_power_plus_01.setFixedWidth(50)
+        self.btn_power_plus_01.setFixedHeight(24)
+        self.btn_power_plus_01.clicked.connect(lambda: self.adjust_esc_power(1))
+        power_row_layout.addWidget(self.btn_power_plus_01, alignment=Qt.AlignmentFlag.AlignLeft)
+
         self.btn_power_minus = QPushButton("-10%")
-        self.btn_power_minus.setFixedWidth(64)
+        self.btn_power_minus.setFixedWidth(50)
         self.btn_power_minus.setFixedHeight(24)
         self.btn_power_minus.clicked.connect(lambda: self.adjust_esc_power(-10))
         power_row_layout.addWidget(self.btn_power_minus, alignment=Qt.AlignmentFlag.AlignLeft)
 
         self.btn_power_plus = QPushButton("+10%")
-        self.btn_power_plus.setFixedWidth(64)
+        self.btn_power_plus.setFixedWidth(50)
         self.btn_power_plus.setFixedHeight(24)
         self.btn_power_plus.clicked.connect(lambda: self.adjust_esc_power(10))
         power_row_layout.addWidget(self.btn_power_plus, alignment=Qt.AlignmentFlag.AlignLeft)
@@ -451,6 +571,28 @@ class RealtimeVibeApp(QMainWindow):
             self.buf_y.append(y)
             self.buf_z.append(z)
 
+    def toggle_time_zoom(self):
+        zoom_enabled = self.btn_zoom_timescale.isChecked()
+        self.set_time_zoom(zoom_enabled)
+
+    def set_time_zoom(self, zoom_enabled):
+        if zoom_enabled:
+            self.time_window_seconds = 0.2
+            self.btn_zoom_timescale.setText("Zoom ON")
+            self.btn_zoom_timescale.setChecked(True)
+            self.btn_zoom_timescale.setStyleSheet("QPushButton { background-color: #d9f7d9; color: #124b12; font-weight: bold; }")
+        else:
+            self.time_window_seconds = 2.0
+            self.btn_zoom_timescale.setText("Zoom")
+            self.btn_zoom_timescale.setChecked(False)
+            self.btn_zoom_timescale.setStyleSheet("")
+
+        self.buf_x = deque(self.buf_x, maxlen=int(FS * self.time_window_seconds))
+        self.buf_y = deque(self.buf_y, maxlen=int(FS * self.time_window_seconds))
+        self.buf_z = deque(self.buf_z, maxlen=int(FS * self.time_window_seconds))
+
+        self.update_plots()
+
     def calibrate(self):
         self.buf_x.clear()
         self.buf_y.clear()
@@ -467,6 +609,27 @@ class RealtimeVibeApp(QMainWindow):
         self.serial_thread.request_calibration()
 
     def calibration_finished(self):
+        self.btn_calibration.setEnabled(True)
+
+    def handle_fc_rpm_update(self, rpm_value):
+        self.fc_rpm = max(0.0, float(rpm_value))
+        if self.fc_rpm <= 0:
+            self.rpm_label.setText("RPM: --")
+            self.rpm_hz_label.setText("Hz: --")
+            return
+
+        hz_value = self.fc_rpm / 60.0
+        self.rpm_label.setText(f"RPM: {self.fc_rpm:.0f}")
+        self.rpm_hz_label.setText(f"Hz: {hz_value:.2f}")
+
+    def reconnect_esp(self):
+        if hasattr(self, "serial_thread"):
+            self.serial_thread.stop()
+
+        self.serial_thread = SerialWorker(self.esp_port, BAUD_RATE)
+        self.serial_thread.data_received.connect(self.handle_sample)
+        self.serial_thread.calibration_finished.connect(self.calibration_finished)
+        self.serial_thread.start()
         self.btn_calibration.setEnabled(True)
 
     def log_fc_diagnostic(self, message, level="INFO"):
@@ -559,10 +722,10 @@ class RealtimeVibeApp(QMainWindow):
         self._run_esc_stop_ramp(current_power)
 
     def get_esc_power_value(self):
-        return max(0, min(100, int(self.esc_power_input.value())))
+        return max(0.0, min(100.0, float(self.esc_power_input.value())))
 
     def set_esc_power_value(self, value):
-        new_value = max(0, min(100, int(value)))
+        new_value = max(0.0, min(100.0, float(value)))
         self.esc_power_input.setValue(new_value)
 
     def set_fft_refresh_rate(self, hz_value):
@@ -581,10 +744,22 @@ class RealtimeVibeApp(QMainWindow):
             self.start_esc()
 
     def adjust_esc_power(self, delta):
-        new_value = max(0, min(100, self.get_esc_power_value() + delta))
+        new_value = max(0.0, min(100.0, self.get_esc_power_value() + float(delta)))
         self.set_esc_power_value(new_value)
         if self.esc_running:
             self.start_esc()
+
+    def _start_fc_telemetry(self):
+        if self.fc_serial is None or not self.fc_serial.is_open:
+            return
+
+        if self.fc_telemetry_thread is not None:
+            self.fc_telemetry_thread.stop()
+            self.fc_telemetry_thread = None
+
+        self.fc_telemetry_thread = FCTelemetryReader(self.fc_serial)
+        self.fc_telemetry_thread.rpm_updated.connect(self.handle_fc_rpm_update)
+        self.fc_telemetry_thread.start()
 
     def reconnect_fc(self):
         if self.fc_serial is not None and self.fc_serial.is_open:
@@ -611,6 +786,7 @@ class RealtimeVibeApp(QMainWindow):
             self.fc_serial = serial.Serial(selected_port, FC_BAUD_RATE, timeout=0.1)
             self.fc_port = selected_port
             self.fc_status_label.setText(f"FC: connected ({selected_port})")
+            self._start_fc_telemetry()
             self.log_fc_diagnostic(f"FC connected successfully on {selected_port}.", "OK")
         except serial.SerialException as error:
             self.fc_status_label.setText(f"FC connection failed: {error}")
@@ -618,6 +794,9 @@ class RealtimeVibeApp(QMainWindow):
 
     def disconnect_fc(self):
         self.log_fc_diagnostic("Disconnecting FC port and resetting ESC state.", "INFO")
+        if self.fc_telemetry_thread is not None:
+            self.fc_telemetry_thread.stop()
+            self.fc_telemetry_thread = None
         if self.fc_serial is not None and self.fc_serial.is_open:
             self.send_motor_values([1000, 1000, 1000, 1000])
             self.fc_serial.close()
@@ -625,6 +804,8 @@ class RealtimeVibeApp(QMainWindow):
         self.fc_port = None
         self.esc_running = False
         self.fc_status_label.setText("FC: disconnected")
+        self.rpm_label.setText("Motor RPM: --")
+        self.rpm_hz_label.setText("Motor Hz: --")
         self.log_fc_diagnostic("FC disconnected.", "OK")
 
     def format_peak_statistics(self, peak_number, peaks):
@@ -689,6 +870,7 @@ class RealtimeVibeApp(QMainWindow):
                 np.max(np.abs(data[i])) * 1.1,
             )
             self.plots_time[i].setYRange(-time_y_limit, time_y_limit, padding=0)
+            self.plots_time[i].setXRange(0, self.time_window_seconds, padding=0)
             average_level = np.mean(np.abs(data[i]))
             self.plots_time[i].setTitle(
                 f"Czasówki - Oś {self.time_axes[i]} - {average_level:.1f} m/s² avg"
@@ -720,28 +902,40 @@ class RealtimeVibeApp(QMainWindow):
         log_dir = os.path.join(os.getcwd(), "logs")
         os.makedirs(log_dir, exist_ok=True)
 
-        filename = self.filename_input.text().strip()
-        if not filename:
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            filename = f"Realtime_Snapshot_{timestamp}.png"
-        elif not filename.lower().endswith(".png"):
-            filename += ".png"
+        base_name = self.filename_input.text().strip()
+        if not base_name:
+            base_name = "snapshot"
+        base_name = os.path.splitext(base_name)[0].strip()
+        if not base_name:
+            base_name = "snapshot"
 
-        filename = os.path.join(log_dir, filename)
+        power_level = int(round(self.get_esc_power_value()))
+        index_value = int(self.filename_index_input.value())
+        requested_name = f"{base_name}{index_value:02d}_{power_level}.png"
 
+        filename = os.path.join(log_dir, requested_name)
+        original_name = os.path.basename(filename)
         if os.path.exists(filename):
-            base_name, ext = os.path.splitext(filename)
+            base_name_only, ext = os.path.splitext(filename)
             counter = 2
             while True:
-                new_name = f"{base_name}_{counter:02d}{ext}"
+                new_name = f"{base_name_only}_{counter:02d}{ext}"
                 if not os.path.exists(new_name):
                     filename = new_name
                     break
                 counter += 1
+            saved_name = os.path.basename(filename)
+            message = f"{original_name} exists already, saved as {saved_name}"
+        else:
+            saved_name = os.path.basename(filename)
+            message = f"{saved_name} saved"
 
         exporter = pg.exporters.ImageExporter(self.graphics_layout.scene())
         exporter.parameters()['width'] = 1920
         exporter.export(filename)
+
+        if hasattr(self, "save_status_label"):
+            self.save_status_label.setText(message)
         print(f"Snapshot saved to {filename}")
 
     def closeEvent(self, event):
@@ -750,6 +944,9 @@ class RealtimeVibeApp(QMainWindow):
 
         if hasattr(self, "serial_thread"):
             self.serial_thread.stop()
+
+        if hasattr(self, "fc_telemetry_thread") and self.fc_telemetry_thread is not None:
+            self.fc_telemetry_thread.stop()
 
         if hasattr(self, "fft_worker"):
             self.fft_worker.requestInterruption()
