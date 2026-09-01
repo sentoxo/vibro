@@ -543,6 +543,7 @@ class RealtimeVibeApp(QMainWindow):
         throttle = 1000 + power_value * 10
         command = [throttle, throttle, throttle, throttle]
         self.send_motor_values(command)
+        self.esc_running = False
         self.set_esc_power_value(power_value)
         self.log_fc_diagnostic(f"ESC stop ramp: {power_value}% for 50 ms.", "INFO")
         QTimer.singleShot(50, lambda: self._run_esc_stop_ramp(power_value - 5))
