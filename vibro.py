@@ -162,69 +162,72 @@ class SerialWorker(QThread):
 
 class FCTelemetryReader(QThread):
     rpm_updated = pyqtSignal(float)
+    MSP_MOTOR_TELEMETRY = 139
+    MOTOR_RECORD_SIZE = 13
 
     def __init__(self, serial_port):
         super().__init__()
         self.ser = serial_port
         self.running = True
-        self.buffer = ""
+        self.buffer = bytearray()
 
-    @staticmethod
-    def _parse_rpm_from_line(line):
-        text = line.strip()
-        if not text:
+    @classmethod
+    def _build_request(cls):
+        command = cls.MSP_MOTOR_TELEMETRY
+        return b"$M<\x00" + bytes((command, command))
+
+    @classmethod
+    def _parse_packet(cls, buffer):
+        while len(buffer) >= 6:
+            start = buffer.find(b"$M>")
+            if start < 0:
+                del buffer[:-2]
+                return None
+            if start:
+                del buffer[:start]
+            payload_size = buffer[3]
+            packet_size = payload_size + 6
+            if len(buffer) < packet_size:
+                return None
+
+            packet = bytes(buffer[:packet_size])
+            del buffer[:packet_size]
+            checksum = 0
+            for byte in packet[3:-1]:
+                checksum ^= byte
+            if checksum == packet[-1] and packet[4] == cls.MSP_MOTOR_TELEMETRY:
+                return packet[5:-1]
+        return None
+
+    @classmethod
+    def _parse_motor_3_rpm(cls, payload):
+        if not payload:
             return None
-
-        patterns = [
-            re.compile(r"(?:rpm|rmp|r/min)\s*[:=]?\s*(\d+(?:\.\d+)?)", re.IGNORECASE),
-            re.compile(r"(\d+(?:\.\d+)?)\s*(?:rpm|rmp|r/min)", re.IGNORECASE),
-            re.compile(r"(?:m[1-4]|motor[1-4])\s*[:=]?\s*(\d+(?:\.\d+)?)", re.IGNORECASE),
-            re.compile(r"(\d+(?:\.\d+)?)\s*hz", re.IGNORECASE),
-            re.compile(r"(?:hz)\s*[:=]?\s*(\d+(?:\.\d+)?)", re.IGNORECASE),
-        ]
-
-        values = []
-        for pattern in patterns:
-            for match in pattern.finditer(text):
-                values.append(float(match.group(1)))
-
-        if not values:
+        motor_count = payload[0]
+        motor_offset = 1 + 2 * cls.MOTOR_RECORD_SIZE
+        if motor_count < 3 or len(payload) < motor_offset + 4:
             return None
-
-        if len(values) > 1:
-            return sum(values) / len(values)
-        return values[0]
+        return struct.unpack_from("<I", payload, 1 + 2 * cls.MOTOR_RECORD_SIZE)[0]
 
     def run(self):
+        next_request = 0.0
         while self.running and self.ser and self.ser.is_open:
             try:
-                if self.ser.in_waiting <= 0:
-                    self.msleep(20)
-                    continue
+                now = time.monotonic()
+                if now >= next_request:
+                    self.ser.write(self._build_request())
+                    next_request = now + 0.1
 
-                chunk = self.ser.read(self.ser.in_waiting)
-                if not chunk:
-                    continue
-
-                self.buffer += chunk.decode("utf-8", errors="replace")
-                while True:
-                    newline_index = self.buffer.find("\n")
-                    carriage_index = self.buffer.find("\r")
-                    split_index = min(
-                        index for index in [newline_index, carriage_index] if index != -1
-                    ) if (newline_index != -1 or carriage_index != -1) else -1
-
-                    if split_index == -1:
-                        break
-
-                    line = self.buffer[:split_index].strip()
-                    self.buffer = self.buffer[split_index + 1:]
-                    if not line:
-                        continue
-
-                    rpm_value = self._parse_rpm_from_line(line)
-                    if rpm_value is not None:
-                        self.rpm_updated.emit(float(rpm_value))
+                if self.ser.in_waiting > 0:
+                    self.buffer.extend(self.ser.read(self.ser.in_waiting))
+                    payload = self._parse_packet(self.buffer)
+                    while payload is not None:
+                        rpm_value = self._parse_motor_3_rpm(payload)
+                        if rpm_value is not None:
+                            self.rpm_updated.emit(float(rpm_value))
+                        payload = self._parse_packet(self.buffer)
+                else:
+                    self.msleep(10)
             except Exception:
                 self.msleep(50)
 
@@ -593,21 +596,6 @@ class RealtimeVibeApp(QMainWindow):
 
         self.update_plots()
 
-    def calibrate(self):
-        self.buf_x.clear()
-        self.buf_y.clear()
-        self.buf_z.clear()
-        for curve in self.curves_time + self.curves_fft:
-            curve.setData([], [])
-        for i, axis in enumerate(self.time_axes):
-            self.plots_time[i].setTitle(f"Czasówki - Oś {axis} - 0.0 m/s² avg")
-        self.average_stat_label.setText("Average vibration: 0.0 m/s²")
-        for peak_number, peak_label in enumerate(self.peak_stat_labels):
-            peak_label.setText(self.format_peak_statistics(peak_number, [[], [], []]))
-        self.cpu_stat_label.setText("CPU usage: 0%")
-        self.btn_calibration.setEnabled(False)
-        self.serial_thread.request_calibration()
-
     def calibration_finished(self):
         self.btn_calibration.setEnabled(True)
 
@@ -651,6 +639,7 @@ class RealtimeVibeApp(QMainWindow):
             self.fc_status_label.setText("FC: disconnected")
             return False
 
+        motor_values = [int(round(value)) for value in motor_values]
         payload = b"".join(struct.pack("<H", value) for value in motor_values)
         packet = b"$M<" + bytes((len(payload), 214)) + payload
         checksum = 0
