@@ -1,5 +1,5 @@
+numpy
 psutil
-serial
-PyQt6.QtCore
-PyQt6.QtWidgets
+pyserial
+PyQt6
 pyqtgraph
