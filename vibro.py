@@ -529,6 +529,7 @@ class RealtimeVibeApp(QMainWindow):
         # Build 3x2 Grid (Rows: X, Y, Z | Cols: Time, FFT)
         self.curves_time = []
         self.curves_fft = []
+        self.fft_rpm_lines = []
         
         colors = ['#1f77b4', '#1f77b4', '#1f77b4'] 
         
@@ -557,6 +558,21 @@ class RealtimeVibeApp(QMainWindow):
             p_fft.setXRange(0, FS / 2)
             if i == 2: p_fft.setLabel('bottom', 'Częstotliwość [Hz]')
             c_fft = p_fft.plot(pen=pg.mkPen(colors[i], width=1.2))
+            rpm_line = pg.InfiniteLine(
+                angle=90,
+                movable=False,
+                pen=pg.mkPen('#d62728', width=2),
+            )
+            double_rpm_line = pg.InfiniteLine(
+                angle=90,
+                movable=False,
+                pen=pg.mkPen('#e6b800', width=2),
+            )
+            rpm_line.setVisible(False)
+            double_rpm_line.setVisible(False)
+            p_fft.addItem(rpm_line)
+            p_fft.addItem(double_rpm_line)
+            self.fft_rpm_lines.append((rpm_line, double_rpm_line))
             self.curves_fft.append(c_fft)
             self.plots_fft.append(p_fft)
 
@@ -604,11 +620,20 @@ class RealtimeVibeApp(QMainWindow):
         if self.fc_rpm <= 0:
             self.rpm_label.setText("RPM: --")
             self.rpm_hz_label.setText("Hz: --")
+            self.update_fft_rpm_indicators(0.0)
             return
 
         hz_value = self.fc_rpm / 60.0
         self.rpm_label.setText(f"RPM: {self.fc_rpm:.0f}")
         self.rpm_hz_label.setText(f"Hz: {hz_value:.2f}")
+        self.update_fft_rpm_indicators(hz_value)
+
+    def update_fft_rpm_indicators(self, motor_hz):
+        frequencies = (float(motor_hz), float(motor_hz) * 2.0)
+        for rpm_line, double_rpm_line in self.fft_rpm_lines:
+            for line, frequency in zip((rpm_line, double_rpm_line), frequencies):
+                line.setPos(frequency)
+                line.setVisible(0.0 < frequency <= FS / 2)
 
     def reconnect_esp(self):
         if hasattr(self, "serial_thread"):
@@ -795,6 +820,7 @@ class RealtimeVibeApp(QMainWindow):
         self.fc_status_label.setText("FC: disconnected")
         self.rpm_label.setText("Motor RPM: --")
         self.rpm_hz_label.setText("Motor Hz: --")
+        self.update_fft_rpm_indicators(0.0)
         self.log_fc_diagnostic("FC disconnected.", "OK")
 
     def format_peak_statistics(self, peak_number, peaks):
