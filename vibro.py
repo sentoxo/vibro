@@ -50,6 +50,7 @@ class PortDialog(QDialog):
     def __init__(self, title="Select ESP32 serial port", message=None, excluded_port=None):
         super().__init__()
         self.excluded_port = excluded_port
+        self.demo_mode = False
         self.setWindowTitle(title)
         self.setMinimumWidth(440)
 
@@ -65,6 +66,9 @@ class PortDialog(QDialog):
         buttons.accepted.connect(self.accept_selected_port)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+        demo_button = buttons.addButton("Demo", QDialogButtonBox.ButtonRole.ActionRole)
+        demo_button.clicked.connect(self.accept_demo)
 
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh_ports)
@@ -95,6 +99,10 @@ class PortDialog(QDialog):
 
     def selected_port(self):
         return self.port_combo.currentData()
+
+    def accept_demo(self):
+        self.demo_mode = True
+        self.accept()
 
 class SerialWorker(QThread):
     data_received = pyqtSignal(int, int, float, float, float)
@@ -288,7 +296,7 @@ class FFTWorker(QThread):
 
 
 class RealtimeVibeApp(QMainWindow):
-    def __init__(self, serial_port):
+    def __init__(self, serial_port=None, demo_mode=False):
         super().__init__()
         self.setWindowTitle("VibroApp")
         self.resize(1600, 900)
@@ -299,6 +307,8 @@ class RealtimeVibeApp(QMainWindow):
         self.buf_z = deque(maxlen=int(FS * self.time_window_seconds))
         self.time_axes = ['X', 'Y', 'Z']
         self.esp_port = serial_port
+        self.demo_mode = demo_mode
+        self.demo_sample_index = 0
         self.fc_serial = None
         self.fc_port = None
         self.esc_running = False
@@ -319,10 +329,17 @@ class RealtimeVibeApp(QMainWindow):
 
         self.init_ui()
 
-        self.serial_thread = SerialWorker(serial_port, BAUD_RATE)
-        self.serial_thread.data_received.connect(self.handle_sample)
-        self.serial_thread.calibration_finished.connect(self.calibration_finished)
-        self.serial_thread.start()
+        if self.demo_mode:
+            self.demo_timer = QTimer(self)
+            self.demo_timer.timeout.connect(self.generate_demo_samples)
+            self.demo_timer.start(5)
+            self.btn_calibration.setText("Reset demo")
+            self.btn_reconnect_esp.setEnabled(False)
+        else:
+            self.serial_thread = SerialWorker(serial_port, BAUD_RATE)
+            self.serial_thread.data_received.connect(self.handle_sample)
+            self.serial_thread.calibration_finished.connect(self.calibration_finished)
+            self.serial_thread.start()
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_plots)
@@ -590,6 +607,18 @@ class RealtimeVibeApp(QMainWindow):
             self.buf_y.append(y)
             self.buf_z.append(z)
 
+    def generate_demo_samples(self):
+        for _ in range(4):
+            sample_time = self.demo_sample_index / FS
+            self.demo_sample_index += 1
+            self.handle_sample(
+                0,
+                self.demo_sample_index,
+                1.1 * np.sin(2.0 * np.pi * 48.0 * sample_time),
+                0.8 * np.sin(2.0 * np.pi * 72.0 * sample_time + 0.7),
+                0.6 * np.sin(2.0 * np.pi * 110.0 * sample_time + 1.4),
+            )
+
     def toggle_time_zoom(self):
         zoom_enabled = self.btn_zoom_timescale.isChecked()
         self.set_time_zoom(zoom_enabled)
@@ -636,6 +665,9 @@ class RealtimeVibeApp(QMainWindow):
                 line.setVisible(0.0 < frequency <= FS / 2)
 
     def reconnect_esp(self):
+        if self.demo_mode:
+            return
+
         if hasattr(self, "serial_thread"):
             self.serial_thread.stop()
 
@@ -910,6 +942,10 @@ class RealtimeVibeApp(QMainWindow):
         for peak_number, peak_label in enumerate(self.peak_stat_labels):
             peak_label.setText(self.format_peak_statistics(peak_number, [[], [], []]))
         self.cpu_stat_label.setText("CPU usage: 0%")
+        if self.demo_mode:
+            self.btn_calibration.setEnabled(True)
+            return
+
         self.btn_calibration.setEnabled(False)
         self.serial_thread.request_calibration()
 
@@ -957,6 +993,9 @@ class RealtimeVibeApp(QMainWindow):
         self.timer.stop()
         self.disconnect_fc()
 
+        if hasattr(self, "demo_timer"):
+            self.demo_timer.stop()
+
         if hasattr(self, "serial_thread"):
             self.serial_thread.stop()
 
@@ -973,12 +1012,14 @@ class RealtimeVibeApp(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     port = find_preferred_port()
+    demo_mode = False
     if port is None:
         port_dialog = PortDialog()
         if port_dialog.exec() != QDialog.DialogCode.Accepted:
             sys.exit(0)
         port = port_dialog.selected_port()
+        demo_mode = port_dialog.demo_mode
 
-    win = RealtimeVibeApp(port)
+    win = RealtimeVibeApp(port, demo_mode=demo_mode)
     win.show()
     sys.exit(app.exec())
