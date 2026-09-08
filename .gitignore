@@ -1,2 +1,4 @@
 *.pyc
 /logs
+*.bin
+!test_data.bin

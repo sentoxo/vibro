@@ -1,5 +1,10 @@
 # AI Generated code for real-time vibration monitoring and ESC control.
 
+# The on-disk burst format (little-endian):
+#   magic "DVB1" | version u16 | axes u16 | sample_rate u32 |
+#   sample_count u32 | timestamp_ns u64 | sequence u64 | int16 samples[count][3]
+
+import argparse
 import os
 import sys
 import re
@@ -15,8 +20,8 @@ from serial.tools import list_ports
 from PyQt6.QtCore import QThread, pyqtSignal, QTimer, Qt
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
-    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-    QPushButton, QSpinBox, QVBoxLayout, QWidget
+    QFileDialog, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QMainWindow, QPushButton, QSpinBox, QVBoxLayout, QWidget
 )
 import pyqtgraph as pg
 
@@ -35,6 +40,144 @@ MAX_FFT_POINTS = 512
 
 SEQ_LINE = re.compile(r"^S(\d),(\d+),(-?\d+),(-?\d+),(-?\d+)\s*$")
 PREFERRED_PORT_DESCRIPTION = "USB_SERIAL CH340"
+
+# === DVB1 BINARY BURST FORMAT ===
+DVB1_MAGIC = b"DVB1"
+DVB1_HEADER_SIZE = 4 + 2 + 2 + 4 + 4 + 8 + 8  # magic|version|axes|rate|count|ts|seq
+DVB1_SAMPLE_RATE = 3200.0                      # Hz
+DVB1_SAMPLE_COUNT = 6400                       # samples per burst
+DVB1_LSB_TO_MS2 = 0.0039 * 9.80665              # ADXL345 8g mode: 3.9 mg/LSB
+FFT_MIN_HZ = 4.0                               # FFT display range
+FFT_MAX_HZ = 1600.0
+
+
+def parse_dvb1_file(path):
+    # Read whole file and split it into bursts (DVB1 format)
+    with open(path, "rb") as f:
+        data = f.read()
+
+    bursts = []
+    offset = 0
+    while offset + DVB1_HEADER_SIZE <= len(data):
+        if data[offset:offset + 4] != DVB1_MAGIC:
+            # Skip garbage byte, search for next magic
+            next_magic = data.find(DVB1_MAGIC, offset + 1)
+            if next_magic < 0:
+                break
+            offset = next_magic
+            continue
+
+        version, axes, sample_rate, sample_count = struct.unpack_from(
+            "<HHII", data, offset + 4
+        )
+        timestamp_ns, sequence = struct.unpack_from("<QQ", data, offset + 16)
+        samples_bytes = sample_count * axes * 2
+        if offset + DVB1_HEADER_SIZE + samples_bytes > len(data):
+            break  # truncated burst
+
+        raw = np.frombuffer(
+            data, dtype="<i2",
+            count=sample_count * axes,
+            offset=offset + DVB1_HEADER_SIZE,
+        ).reshape(sample_count, axes)
+
+        bursts.append({
+            "version": version,
+            "axes": axes,
+            "sample_rate": float(sample_rate),
+            "sample_count": sample_count,
+            "timestamp_ns": timestamp_ns,
+            "sequence": sequence,
+            "samples": raw[:, :3].astype(np.float64) * DVB1_LSB_TO_MS2,
+        })
+        offset += DVB1_HEADER_SIZE + samples_bytes
+
+    return bursts
+
+
+class ModeDialog(QDialog):
+    # Startup dialog: choose serial port, demo mode, or binary file mode
+    MODE_SERIAL = "serial"
+    MODE_DEMO = "demo"
+    MODE_FILE = "file"
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Select mode")
+        self.setMinimumWidth(480)
+        self.mode = None
+        self.port = None
+        self.file_path = None
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Select data source:"))
+
+        self.port_combo = QComboBox()
+        layout.addWidget(self.port_combo)
+
+        self.file_row = QHBoxLayout()
+        self.file_input = QLineEdit()
+        self.file_input.setPlaceholderText("Binary burst file (.dvb)")
+        self.file_row.addWidget(self.file_input)
+        browse_button = QPushButton("Browse...")
+        browse_button.clicked.connect(self.browse_file)
+        self.file_row.addWidget(browse_button)
+        layout.addLayout(self.file_row)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept_mode)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        demo_button = buttons.addButton("Demo", QDialogButtonBox.ButtonRole.ActionRole)
+        demo_button.clicked.connect(self.accept_demo)
+
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self.refresh_ports)
+        self.refresh_timer.start(1000)
+        self.refresh_ports()
+
+    def refresh_ports(self):
+        selected_port = self.port_combo.currentData()
+        ports = sorted(list_ports.comports(), key=lambda port: port.device)
+
+        self.port_combo.blockSignals(True)
+        self.port_combo.clear()
+        for port in ports:
+            description = port.description or "Unknown device"
+            self.port_combo.addItem(f"{port.device} - {description}", port.device)
+        if selected_port:
+            selected_index = self.port_combo.findData(selected_port)
+            if selected_index >= 0:
+                self.port_combo.setCurrentIndex(selected_index)
+        self.port_combo.blockSignals(False)
+
+    def browse_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select binary burst file", "",
+            "Burst files (*.dvb *.bin);;All files (*)"
+        )
+        if path:
+            self.file_input.setText(path)
+
+    def accept_mode(self):
+        # OK button: file mode if a file is chosen, otherwise serial port
+        path = self.file_input.text().strip()
+        if path:
+            self.mode = self.MODE_FILE
+            self.file_path = path
+        elif self.port_combo.currentData():
+            self.mode = self.MODE_SERIAL
+            self.port = self.port_combo.currentData()
+        else:
+            return
+        self.accept()
+
+    def accept_demo(self):
+        self.mode = self.MODE_DEMO
+        self.accept()
 
 
 def find_preferred_port():
@@ -252,9 +395,9 @@ class FFTWorker(QThread):
         self.queue = deque()
         self.lock = threading.Lock()
 
-    def submit(self, axis_index, signal_arr):
+    def submit(self, axis_index, signal_arr, sample_rate=FS, full=False):
         with self.lock:
-            self.queue.append((axis_index, signal_arr))
+            self.queue.append((axis_index, signal_arr, sample_rate, full))
 
     def run(self):
         while not self.isInterruptionRequested():
@@ -267,27 +410,29 @@ class FFTWorker(QThread):
                 self.msleep(10)
                 continue
 
-            axis_index, signal_arr = item
-            freqs, amps = self.compute_fft(signal_arr)
+            axis_index, signal_arr, sample_rate, full = item
+            freqs, amps = self.compute_fft(signal_arr, sample_rate, full)
             self.result_ready.emit(axis_index, freqs, amps)
 
     @staticmethod
-    def compute_fft(signal_arr):
+    def compute_fft(signal_arr, sample_rate=FS, full=False):
         arr = np.asarray(signal_arr, dtype=np.float64)
         n = len(arr)
         if n < 64:
             return np.array([]), np.array([])
 
-        n = min(n, MAX_FFT_POINTS)
-        if len(arr) > n:
-            arr = arr[-n:]
+        if not full:
+            # Live mode: cap FFT length for speed
+            n = min(n, MAX_FFT_POINTS)
+            if len(arr) > n:
+                arr = arr[-n:]
 
         sig = arr - np.mean(arr)
         window = np.hanning(n)
         scale = np.sum(window) / n
 
         yf = np.fft.rfft(sig * window)
-        freqs = np.fft.rfftfreq(n, 1.0 / FS)
+        freqs = np.fft.rfftfreq(n, 1.0 / sample_rate)
         amp = (np.abs(yf) / n) / scale
         if n > 1:
             amp[1:-1] *= 2.0
@@ -296,7 +441,7 @@ class FFTWorker(QThread):
 
 
 class RealtimeVibeApp(QMainWindow):
-    def __init__(self, serial_port=None, demo_mode=False):
+    def __init__(self, serial_port=None, demo_mode=False, file_path=None):
         super().__init__()
         self.setWindowTitle("VibroApp")
         self.resize(1600, 900)
@@ -308,6 +453,10 @@ class RealtimeVibeApp(QMainWindow):
         self.time_axes = ['X', 'Y', 'Z']
         self.esp_port = serial_port
         self.demo_mode = demo_mode
+        self.file_mode = file_path is not None
+        self.file_path = file_path
+        self.file_bursts = []
+        self.current_burst_index = 0
         self.demo_sample_index = 0
         self.fc_serial = None
         self.fc_port = None
@@ -329,12 +478,14 @@ class RealtimeVibeApp(QMainWindow):
 
         self.init_ui()
 
-        if self.demo_mode:
-            self.demo_timer = QTimer(self)
-            self.demo_timer.timeout.connect(self.generate_demo_samples)
-            self.demo_timer.start(5)
-            self.btn_calibration.setText("Reset demo")
-            self.btn_reconnect_esp.setEnabled(False)
+        if self.file_mode:
+            # File mode: load bursts and show the first one
+            self.load_burst_file(self.file_path)
+        elif self.demo_mode:
+            # Demo mode: generate synthetic bursts, selectable from list box
+            self.btn_calibration.setVisible(False)
+            self.btn_reconnect_esp.setVisible(False)
+            self.generate_demo_bursts()
         else:
             self.serial_thread = SerialWorker(serial_port, BAUD_RATE)
             self.serial_thread.data_received.connect(self.handle_sample)
@@ -367,16 +518,11 @@ class RealtimeVibeApp(QMainWindow):
             peak_label = QLabel(self.format_peak_statistics(peak_number, [[], [], []]))
             self.peak_stat_labels.append(peak_label)
             statistics_layout.addWidget(peak_label, peak_number + 2, 0, 1, 3)
-        self.rpm_label = QLabel("Motor RPM: --")
-        self.rpm_label.setStyleSheet("QLabel { font-weight: 600; }")
-        statistics_layout.addWidget(self.rpm_label, 5, 0, 1, 3)
 
-        self.rpm_hz_label = QLabel("Motor Hz: --")
-        self.rpm_hz_label.setStyleSheet("QLabel { font-weight: 600; }")
-        statistics_layout.addWidget(self.rpm_hz_label, 6, 0, 1, 3)
-
-        self.cpu_stat_label = QLabel("CPU usage: 0%")
-        statistics_layout.addWidget(self.cpu_stat_label, 7, 0, 1, 3)
+        # Burst metadata (file mode only)
+        self.burst_info_label = QLabel("")
+        self.burst_info_label.setWordWrap(True)
+        statistics_layout.addWidget(self.burst_info_label, 5, 0, 1, 3)
         statistics_layout.addWidget(QLabel(""), 8, 0, 1, 3)
 
         settings_box = QGroupBox("Settings")
@@ -396,6 +542,17 @@ class RealtimeVibeApp(QMainWindow):
         self.btn_reconnect_esp.clicked.connect(self.reconnect_esp)
         self.btn_reconnect_esp.setFixedWidth(200)
         settings_layout.addWidget(self.btn_reconnect_esp)
+        if self.demo_mode or self.file_mode:
+            # Hide ESP reconnect button in demo and file modes
+            self.btn_reconnect_esp.setVisible(False)
+
+        # Burst selector for demo / file modes
+        self.burst_combo = QComboBox()
+        self.burst_combo.setFixedWidth(200)
+        self.burst_combo.currentIndexChanged.connect(self.on_burst_selected)
+        settings_layout.addWidget(self.burst_combo)
+        if not self.demo_mode and not self.file_mode:
+            self.burst_combo.setVisible(False)
 
         self.btn_zoom_timescale = QPushButton("Zoom")
         self.btn_zoom_timescale.setCheckable(True)
@@ -572,7 +729,8 @@ class RealtimeVibeApp(QMainWindow):
             p_fft.showGrid(x=True, y=True)
             p_fft.setLabel('left', '[m/s²]')
             p_fft.setYRange(0, FFT_Y_MAX)
-            p_fft.setXRange(0, FS / 2)
+            # FFT range: 4 Hz .. 1600 Hz (sensor at 3200 Hz)
+            p_fft.setXRange(FFT_MIN_HZ, FFT_MAX_HZ)
             if i == 2: p_fft.setLabel('bottom', 'Częstotliwość [Hz]')
             c_fft = p_fft.plot(pen=pg.mkPen(colors[i], width=1.2))
             rpm_line = pg.InfiniteLine(
@@ -607,17 +765,105 @@ class RealtimeVibeApp(QMainWindow):
             self.buf_y.append(y)
             self.buf_z.append(z)
 
-    def generate_demo_samples(self):
-        for _ in range(4):
-            sample_time = self.demo_sample_index / FS
-            self.demo_sample_index += 1
-            self.handle_sample(
-                0,
-                self.demo_sample_index,
-                1.1 * np.sin(2.0 * np.pi * 48.0 * sample_time),
-                0.8 * np.sin(2.0 * np.pi * 72.0 * sample_time + 0.7),
-                0.6 * np.sin(2.0 * np.pi * 110.0 * sample_time + 1.4),
+    def generate_demo_bursts(self):
+        # Build synthetic bursts matching the DVB1 format (3200 Hz, 6400 samples)
+        demo_rates = [48.0, 72.0, 110.0, 160.0]
+        base_timestamp = int(time.time() * 1e9)
+        for burst_number, demo_hz in enumerate(demo_rates):
+            t = np.arange(DVB1_SAMPLE_COUNT) / DVB1_SAMPLE_RATE
+            x = 1.1 * np.sin(2.0 * np.pi * demo_hz * t)
+            y = 0.8 * np.sin(2.0 * np.pi * demo_hz * 1.5 * t + 0.7)
+            z = 0.6 * np.sin(2.0 * np.pi * demo_hz * 2.0 * t + 1.4)
+            self.file_bursts.append({
+                "version": 1,
+                "axes": 3,
+                "sample_rate": int(DVB1_SAMPLE_RATE),
+                "sample_count": DVB1_SAMPLE_COUNT,
+                "timestamp_ns": base_timestamp + burst_number * 1_000_000_000,
+                "sequence": burst_number + 1,
+                "samples": np.column_stack((x, y, z)),
+            })
+
+        self.burst_combo.blockSignals(True)
+        for index, burst in enumerate(self.file_bursts):
+            self.burst_combo.addItem(f"Burst {index + 1} (seq {burst['sequence']})", index)
+        self.burst_combo.blockSignals(False)
+        self.burst_combo.setCurrentIndex(0)
+        self.display_burst(0)
+
+    def load_burst_file(self, path):
+        # Read binary file and split it into DVB1 bursts
+        try:
+            self.file_bursts = parse_dvb1_file(path)
+        except Exception as error:
+            self.file_bursts = []
+            self.burst_info_label.setText(f"File error: {error}")
+            return
+
+        self.burst_combo.blockSignals(True)
+        self.burst_combo.clear()
+        for index, burst in enumerate(self.file_bursts):
+            self.burst_combo.addItem(f"Burst {index + 1} (seq {burst['sequence']})", index)
+        self.burst_combo.blockSignals(False)
+
+        if self.file_bursts:
+            self.current_burst_index = 0
+            self.burst_combo.setCurrentIndex(0)
+            self.display_burst(0)
+        else:
+            self.burst_info_label.setText("No bursts found in file")
+
+    def on_burst_selected(self, index):
+        # User picked a different burst from the list box
+        if 0 <= index < len(self.file_bursts):
+            self.display_burst(index)
+
+    def display_burst(self, burst_index):
+        # Show one full burst in time plots and compute its FFT
+        burst = self.file_bursts[burst_index]
+        self.current_burst_index = burst_index
+        self.current_fs = burst["sample_rate"] or DVB1_SAMPLE_RATE
+
+        samples = burst["samples"]
+        count = len(samples)
+        if count == 0:
+            return  # nothing to draw for an empty burst
+        t = np.arange(count) / self.current_fs
+
+        # Use the burst array directly (buffers are too small for 6400 samples)
+        data = [samples[:, 0], samples[:, 1], samples[:, 2]]
+
+        # Human-readable timestamp
+        timestamp_seconds = burst["timestamp_ns"] / 1e9
+        timestamp_text = time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.localtime(timestamp_seconds)
+        )
+        milliseconds = int(burst["timestamp_ns"] % 1_000_000_000 / 1_000_000)
+        self.burst_info_label.setText(
+            f"Burst {burst_index + 1}/{len(self.file_bursts)} | "
+            f"samples: {burst['sample_count']} | "
+            f"timestamp: {timestamp_text}.{milliseconds:03d} | "
+            f"sequence: {burst['sequence']}"
+        )
+
+        # Draw time plots immediately
+        for i in range(3):
+            self.curves_time[i].setData(t, data[i])
+            time_y_limit = max(TIME_Y_MIN_RANGE / 2, np.max(np.abs(data[i])) * 1.1)
+            self.plots_time[i].setYRange(-time_y_limit, time_y_limit, padding=0)
+            self.plots_time[i].setXRange(0, count / self.current_fs, padding=0)
+            average_level = np.mean(np.abs(data[i]))
+            self.plots_time[i].setTitle(
+                f"Czasówki - Oś {self.time_axes[i]} - {average_level:.1f} m/s² avg"
             )
+        self.average_stat_label.setText(
+            f"Average vibration: {np.mean(np.abs(np.concatenate(data))):.1f} m/s²"
+        )
+
+        # Submit full burst for FFT (no MAX_FFT_POINTS downsampling for file mode)
+        for i in range(3):
+            self.fft_worker.submit(i, data[i], self.current_fs, full=True)
+        self.fft_cache = [None, None, None]
 
     def toggle_time_zoom(self):
         zoom_enabled = self.btn_zoom_timescale.isChecked()
@@ -646,23 +892,16 @@ class RealtimeVibeApp(QMainWindow):
 
     def handle_fc_rpm_update(self, rpm_value):
         self.fc_rpm = max(0.0, float(rpm_value))
-        if self.fc_rpm <= 0:
-            self.rpm_label.setText("RPM: --")
-            self.rpm_hz_label.setText("Hz: --")
-            self.update_fft_rpm_indicators(0.0)
-            return
-
         hz_value = self.fc_rpm / 60.0
-        self.rpm_label.setText(f"RPM: {self.fc_rpm:.0f}")
-        self.rpm_hz_label.setText(f"Hz: {hz_value:.2f}")
         self.update_fft_rpm_indicators(hz_value)
 
     def update_fft_rpm_indicators(self, motor_hz):
+        max_frequency = DVB1_SAMPLE_RATE / 2.0  # file-mode sensor rate cap
         frequencies = (float(motor_hz), float(motor_hz) * 2.0)
         for rpm_line, double_rpm_line in self.fft_rpm_lines:
             for line, frequency in zip((rpm_line, double_rpm_line), frequencies):
                 line.setPos(frequency)
-                line.setVisible(0.0 < frequency <= FS / 2)
+                line.setVisible(0.0 < frequency <= max_frequency)
 
     def reconnect_esp(self):
         if self.demo_mode:
@@ -850,8 +1089,6 @@ class RealtimeVibeApp(QMainWindow):
         self.fc_port = None
         self.esc_running = False
         self.fc_status_label.setText("FC: disconnected")
-        self.rpm_label.setText("Motor RPM: --")
-        self.rpm_hz_label.setText("Motor Hz: --")
         self.update_fft_rpm_indicators(0.0)
         self.log_fc_diagnostic("FC disconnected.", "OK")
 
@@ -897,6 +1134,8 @@ class RealtimeVibeApp(QMainWindow):
             peak_label.setText(self.format_peak_statistics(peak_number, fft_peaks))
 
     def update_plots(self):
+        if self.file_mode:
+            return  # file mode plots are drawn once per burst
         if len(self.buf_x) < 64:
             return
 
@@ -905,10 +1144,6 @@ class RealtimeVibeApp(QMainWindow):
         self.average_stat_label.setText(
             f"Average vibration: {np.mean(np.abs(np.concatenate(data))):.1f} m/s²"
         )
-        cpu_usage = self.process.cpu_percent() #/ self.cpu_count
-        self.cpu_history.append(max(0.0, min(100.0, cpu_usage)))
-        average_cpu_usage = np.mean(self.cpu_history)
-        self.cpu_stat_label.setText(f"CPU usage: {average_cpu_usage:.0f}%")
 
         for i in range(3):
             self.curves_time[i].setData(t, data[i])
@@ -941,7 +1176,6 @@ class RealtimeVibeApp(QMainWindow):
         self.average_stat_label.setText("Average vibration: 0.0 m/s²")
         for peak_number, peak_label in enumerate(self.peak_stat_labels):
             peak_label.setText(self.format_peak_statistics(peak_number, [[], [], []]))
-        self.cpu_stat_label.setText("CPU usage: 0%")
         if self.demo_mode:
             self.btn_calibration.setEnabled(True)
             return
@@ -996,6 +1230,7 @@ class RealtimeVibeApp(QMainWindow):
         if hasattr(self, "demo_timer"):
             self.demo_timer.stop()
 
+
         if hasattr(self, "serial_thread"):
             self.serial_thread.stop()
 
@@ -1010,16 +1245,59 @@ class RealtimeVibeApp(QMainWindow):
         event.accept()
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    port = find_preferred_port()
-    demo_mode = False
-    if port is None:
-        port_dialog = PortDialog()
-        if port_dialog.exec() != QDialog.DialogCode.Accepted:
-            sys.exit(0)
-        port = port_dialog.selected_port()
-        demo_mode = port_dialog.demo_mode
+    parser = argparse.ArgumentParser(description="VibroApp")
+    parser.add_argument(
+        "--file", metavar="PATH",
+        help="open a binary burst file (DVB1) instead of asking for a mode",
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="debug mode: validate the file (with --file) and exit without GUI",
+    )
+    args = parser.parse_args()
 
-    win = RealtimeVibeApp(port, demo_mode=demo_mode)
+    # Debug mode: just check the file and report, no GUI
+    if args.debug:
+        if not args.file:
+            print("ERROR: --debug requires --file PATH")
+            sys.exit(2)
+        try:
+            bursts = parse_dvb1_file(args.file)
+        except Exception as error:
+            print(f"ERROR: could not open {args.file}: {error}")
+            sys.exit(1)
+        if not bursts:
+            print(f"ERROR: no DVB1 bursts found in {args.file}")
+            sys.exit(1)
+        for index, burst in enumerate(bursts):
+            print(
+                f"Burst {index + 1}: seq={burst['sequence']} "
+                f"rate={burst['sample_rate']}Hz samples={burst['sample_count']} "
+                f"ts_ns={burst['timestamp_ns']}"
+            )
+        print(f"OK: {len(bursts)} burst(s) loaded from {args.file}")
+        sys.exit(0)
+
+    app = QApplication(sys.argv)
+    port = None
+    demo_mode = False
+    file_path = None
+
+    if args.file:
+        # CLI file mode: skip the mode dialog
+        file_path = args.file
+    else:
+        # Show mode selection dialog at startup
+        mode_dialog = ModeDialog()
+        if mode_dialog.exec() != QDialog.DialogCode.Accepted:
+            sys.exit(0)
+        if mode_dialog.mode == ModeDialog.MODE_DEMO:
+            demo_mode = True
+        elif mode_dialog.mode == ModeDialog.MODE_FILE:
+            file_path = mode_dialog.file_path
+        else:
+            port = mode_dialog.port
+
+    win = RealtimeVibeApp(port, demo_mode=demo_mode, file_path=file_path)
     win.show()
     sys.exit(app.exec())
