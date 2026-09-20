@@ -48,7 +48,13 @@ DVB1_SAMPLE_RATE = 3200.0                      # Hz
 DVB1_SAMPLE_COUNT = 6400                       # samples per burst
 DVB1_LSB_TO_MS2 = 0.0039 * 9.80665              # ADXL345 8g mode: 3.9 mg/LSB
 FFT_MIN_HZ = 4.0                               # FFT display range
-FFT_MAX_HZ = 1600.0
+FFT_MAX_FREQ_CHOICES = [200, 400, 600, 800, 1000, 1200, 1600]  # Hz, FFT max-frequency options
+DEFAULT_FFT_MAX_FREQ = 800.0                     # Hz, default FFT max frequency
+
+
+def remove_gravity_component(axis_data):
+    # Remove the constant (DC / gravity) component from each axis.
+    return [axis - np.mean(axis) for axis in axis_data]
 
 
 def parse_dvb1_file(path):
@@ -251,10 +257,14 @@ class SerialWorker(QThread):
     data_received = pyqtSignal(int, int, float, float, float)
     calibration_finished = pyqtSignal()
 
-    def __init__(self, port, baudrate):
+    def __init__(self, port, baudrate, lsb_per_g=256.0):
         super().__init__()
         self.port = port
         self.baudrate = baudrate
+        # Sensor sensitivity in LSB per g. Converted to m/s^2 per LSB so the
+        # rest of the app always works in m/s^2 regardless of the hardware.
+        self.lsb_per_g = lsb_per_g
+        self.ms2_per_lsb = (1.0 / self.lsb_per_g) * 9.80665
         self.running = True
         self.ser = None
         self.calibration_requested = threading.Event()
@@ -284,9 +294,9 @@ class SerialWorker(QThread):
                     sid, seq, raw_x, raw_y, raw_z = map(int, match.groups())
                     self.data_received.emit(
                         sid, seq,
-                        raw_x * LSB_TO_MS2,
-                        raw_y * LSB_TO_MS2,
-                        raw_z * LSB_TO_MS2,
+                        raw_x * self.ms2_per_lsb,
+                        raw_y * self.ms2_per_lsb,
+                        raw_z * self.ms2_per_lsb,
                     )
 
             if self.ser and self.ser.is_open:
@@ -447,9 +457,12 @@ class RealtimeVibeApp(QMainWindow):
         self.resize(1600, 900)
 
         self.time_window_seconds = 2.0
-        self.buf_x = deque(maxlen=int(FS * self.time_window_seconds))
-        self.buf_y = deque(maxlen=int(FS * self.time_window_seconds))
-        self.buf_z = deque(maxlen=int(FS * self.time_window_seconds))
+        # FFT max frequency (Hz) also sets the live Nyquist: live_sample_rate = 2 * fft_max_freq.
+        self.fft_max_freq = DEFAULT_FFT_MAX_FREQ
+        self.live_sample_rate = 2.0 * self.fft_max_freq
+        self.buf_x = deque(maxlen=int(self.live_sample_rate * self.time_window_seconds))
+        self.buf_y = deque(maxlen=int(self.live_sample_rate * self.time_window_seconds))
+        self.buf_z = deque(maxlen=int(self.live_sample_rate * self.time_window_seconds))
         self.time_axes = ['X', 'Y', 'Z']
         self.esp_port = serial_port
         self.demo_mode = demo_mode
@@ -475,6 +488,9 @@ class RealtimeVibeApp(QMainWindow):
         self.last_fft_update = 0.0
         self.fft_refresh_hz = DEFAULT_FFT_REFRESH_HZ
         self.fft_update_interval = FFT_UPDATE_INTERVAL
+        # Default to the old ADXL345 (256 LSB/g). Changed via the Settings
+        # dropdown; also applied live to a running serial worker.
+        self.lsb_per_g = 256.0
 
         self.init_ui()
 
@@ -483,13 +499,11 @@ class RealtimeVibeApp(QMainWindow):
             self.load_burst_file(self.file_path)
         elif self.demo_mode:
             # Demo mode: generate synthetic bursts, selectable from list box
-            self.btn_calibration.setVisible(False)
             self.btn_reconnect_esp.setVisible(False)
             self.generate_demo_bursts()
         else:
-            self.serial_thread = SerialWorker(serial_port, BAUD_RATE)
+            self.serial_thread = SerialWorker(serial_port, BAUD_RATE, self.lsb_per_g)
             self.serial_thread.data_received.connect(self.handle_sample)
-            self.serial_thread.calibration_finished.connect(self.calibration_finished)
             self.serial_thread.start()
 
         self.timer = QTimer()
@@ -519,6 +533,10 @@ class RealtimeVibeApp(QMainWindow):
             self.peak_stat_labels.append(peak_label)
             statistics_layout.addWidget(peak_label, peak_number + 2, 0, 1, 3)
 
+        # CPU usage (live, smoothed average over the last 10 samples)
+        self.cpu_stat_label = QLabel("CPU usage: 0%")
+        statistics_layout.addWidget(self.cpu_stat_label, 6, 0, 1, 3)
+
         # Burst metadata (file mode only)
         self.burst_info_label = QLabel("")
         self.burst_info_label.setWordWrap(True)
@@ -532,11 +550,6 @@ class RealtimeVibeApp(QMainWindow):
         settings_layout = QVBoxLayout(settings_box)
         settings_layout.setContentsMargins(8, 12, 8, 8)
         settings_layout.setSpacing(6)
-
-        self.btn_calibration = QPushButton("Calibration")
-        self.btn_calibration.clicked.connect(self.calibrate)
-        self.btn_calibration.setFixedWidth(200)
-        settings_layout.addWidget(self.btn_calibration)
 
         self.btn_reconnect_esp = QPushButton("Reconnect to esp")
         self.btn_reconnect_esp.clicked.connect(self.reconnect_esp)
@@ -572,8 +585,34 @@ class RealtimeVibeApp(QMainWindow):
         self.fft_refresh_input.valueChanged.connect(self.set_fft_refresh_rate)
         settings_layout.addWidget(self.fft_refresh_input)
 
+        # FFT graph maximum frequency selector.  The chosen value sets both the
+        # FFT display range and the live sample rate (Nyquist = sample_rate / 2).
+        fft_max_label = QLabel("FFT max frequency:")
+        settings_layout.addWidget(fft_max_label)
+
+        self.fft_max_freq_input = QComboBox()
+        self.fft_max_freq_input.setFixedWidth(200)
+        for _f in FFT_MAX_FREQ_CHOICES:
+            self.fft_max_freq_input.addItem(str(_f), int(_f))
+        self.fft_max_freq_input.setCurrentIndex(FFT_MAX_FREQ_CHOICES.index(DEFAULT_FFT_MAX_FREQ))
+        self.fft_max_freq_input.currentIndexChanged.connect(self.on_fft_max_freq_changed)
+        settings_layout.addWidget(self.fft_max_freq_input)
+
+        # Sensor sensitivity selector: choose the LSB/g converter for the
+        # connected accelerometer. 256 = old ADXL345, 2048 = new sensor.
+        sensor_label = QLabel("Sensor sensitivity:")
+        settings_layout.addWidget(sensor_label)
+
+        self.sensor_sensitivity_combo = QComboBox()
+        self.sensor_sensitivity_combo.addItem("256 (old ADXL345)", 256)
+        self.sensor_sensitivity_combo.addItem("2048 (new sensor)", 2048)
+        self.sensor_sensitivity_combo.setCurrentIndex(0)
+        self.sensor_sensitivity_combo.setFixedWidth(200)
+        self.sensor_sensitivity_combo.currentIndexChanged.connect(self.on_sensor_sensitivity_changed)
+        settings_layout.addWidget(self.sensor_sensitivity_combo)
+
         settings_layout.addStretch(1)
-        settings_box.setFixedHeight(200)
+        settings_box.setFixedHeight(260)
         settings_box.setFixedWidth(220)
 
         action_box = QGroupBox("File")
@@ -729,8 +768,8 @@ class RealtimeVibeApp(QMainWindow):
             p_fft.showGrid(x=True, y=True)
             p_fft.setLabel('left', '[m/s²]')
             p_fft.setYRange(0, FFT_Y_MAX)
-            # FFT range: 4 Hz .. 1600 Hz (sensor at 3200 Hz)
-            p_fft.setXRange(FFT_MIN_HZ, FFT_MAX_HZ)
+            # FFT range: 4 Hz .. selected max frequency (see Settings).
+            p_fft.setXRange(FFT_MIN_HZ, self.fft_max_freq, padding=0)
             if i == 2: p_fft.setLabel('bottom', 'Częstotliwość [Hz]')
             c_fft = p_fft.plot(pen=pg.mkPen(colors[i], width=1.2))
             rpm_line = pg.InfiniteLine(
@@ -833,6 +872,9 @@ class RealtimeVibeApp(QMainWindow):
         # Use the burst array directly (buffers are too small for 6400 samples)
         data = [samples[:, 0], samples[:, 1], samples[:, 2]]
 
+        # Remove the constant gravity component so only vibration remains
+        data = remove_gravity_component(data)
+
         # Human-readable timestamp
         timestamp_seconds = burst["timestamp_ns"] / 1e9
         timestamp_text = time.strftime(
@@ -887,9 +929,6 @@ class RealtimeVibeApp(QMainWindow):
 
         self.update_plots()
 
-    def calibration_finished(self):
-        self.btn_calibration.setEnabled(True)
-
     def handle_fc_rpm_update(self, rpm_value):
         self.fc_rpm = max(0.0, float(rpm_value))
         hz_value = self.fc_rpm / 60.0
@@ -910,11 +949,9 @@ class RealtimeVibeApp(QMainWindow):
         if hasattr(self, "serial_thread"):
             self.serial_thread.stop()
 
-        self.serial_thread = SerialWorker(self.esp_port, BAUD_RATE)
+        self.serial_thread = SerialWorker(self.esp_port, BAUD_RATE, self.lsb_per_g)
         self.serial_thread.data_received.connect(self.handle_sample)
-        self.serial_thread.calibration_finished.connect(self.calibration_finished)
         self.serial_thread.start()
-        self.btn_calibration.setEnabled(True)
 
     def log_fc_diagnostic(self, message, level="INFO"):
         timestamp = time.strftime("%H:%M:%S")
@@ -1023,6 +1060,37 @@ class RealtimeVibeApp(QMainWindow):
             self.fft_refresh_input.blockSignals(True)
             self.fft_refresh_input.setValue(self.fft_refresh_hz)
             self.fft_refresh_input.blockSignals(False)
+
+    def on_sensor_sensitivity_changed(self, index):
+        # Update the physical conversion factor from the Settings dropdown and
+        # push it to a running serial worker so live data re-scales immediately.
+        value = self.sensor_sensitivity_combo.currentData()
+        if value is None:
+            return
+        self.lsb_per_g = float(value)
+        if hasattr(self, "serial_thread") and self.serial_thread is not None:
+            self.serial_thread.lsb_per_g = float(value)
+            self.serial_thread.ms2_per_lsb = (1.0 / float(value)) * 9.80665
+
+    def on_fft_max_freq_changed(self, index):
+        # Wrapper so the combo's currentIndexChanged delivers the stored value.
+        hz = int(self.fft_max_freq_input.currentData())
+        self.set_fft_max_frequency(hz)
+
+    def set_fft_max_frequency(self, hz):
+        # Set the FFT display max frequency (Hz) and the live sample rate used to
+        # compute the FFT frequency axis. Nyquist = sample_rate / 2, so the live
+        # sample rate is twice the chosen max frequency.
+        self.fft_max_freq = float(hz)
+        self.live_sample_rate = 2.0 * self.fft_max_freq
+        # Rebuild the time-domain buffers so they still hold ~time_window_seconds.
+        self.buf_x = deque(maxlen=int(self.live_sample_rate * self.time_window_seconds))
+        self.buf_y = deque(maxlen=int(self.live_sample_rate * self.time_window_seconds))
+        self.buf_z = deque(maxlen=int(self.live_sample_rate * self.time_window_seconds))
+        # Widen/shrink the FFT display range on all three axes if they exist.
+        if hasattr(self, "plots_fft"):
+            for p_fft in self.plots_fft:
+                p_fft.setXRange(FFT_MIN_HZ, self.fft_max_freq, padding=0)
 
     def update_esc_power(self):
         if self.esc_running:
@@ -1140,10 +1208,17 @@ class RealtimeVibeApp(QMainWindow):
             return
 
         data = [np.array(self.buf_x), np.array(self.buf_y), np.array(self.buf_z)]
-        t = np.arange(len(data[0])) / FS
+        # Remove the constant gravity component so only vibration remains
+        data = remove_gravity_component(data)
+        t = np.arange(len(data[0])) / self.live_sample_rate
         self.average_stat_label.setText(
             f"Average vibration: {np.mean(np.abs(np.concatenate(data))):.1f} m/s²"
         )
+
+        # Sample CPU usage and show a smoothed average over recent samples.
+        self.cpu_history.append(max(0.0, min(100.0, self.process.cpu_percent())))
+        average_cpu_usage = np.mean(self.cpu_history)
+        self.cpu_stat_label.setText(f"CPU usage: {average_cpu_usage:.0f}%")
 
         for i in range(3):
             self.curves_time[i].setData(t, data[i])
@@ -1161,27 +1236,10 @@ class RealtimeVibeApp(QMainWindow):
         now = time.perf_counter()
         if now - self.last_fft_update >= self.fft_update_interval:
             self.last_fft_update = now
+            # Pass the live sample rate so the FFT frequency axis matches the
+            # currently selected FFT max frequency (Nyquist = sample_rate / 2).
             for i in range(3):
-                self.fft_worker.submit(i, data[i])
-
-    def calibrate(self):
-        self.buf_x.clear()
-        self.buf_y.clear()
-        self.buf_z.clear()
-        self.fft_cache = [None, None, None]
-        for curve in self.curves_time + self.curves_fft:
-            curve.setData([], [])
-        for i, axis in enumerate(self.time_axes):
-            self.plots_time[i].setTitle(f"Czasówki - Oś {axis} - 0.0 m/s² avg")
-        self.average_stat_label.setText("Average vibration: 0.0 m/s²")
-        for peak_number, peak_label in enumerate(self.peak_stat_labels):
-            peak_label.setText(self.format_peak_statistics(peak_number, [[], [], []]))
-        if self.demo_mode:
-            self.btn_calibration.setEnabled(True)
-            return
-
-        self.btn_calibration.setEnabled(False)
-        self.serial_thread.request_calibration()
+                self.fft_worker.submit(i, data[i], self.live_sample_rate)
 
     def save_png(self):
         log_dir = os.path.join(os.getcwd(), "logs")
