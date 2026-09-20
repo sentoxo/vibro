@@ -478,6 +478,11 @@ class RealtimeVibeApp(QMainWindow):
         self.cpu_count = max(psutil.cpu_count() or 1, 1)
         self.cpu_history = deque(maxlen=10)
         self.process.cpu_percent(None)
+
+        # Incoming-data statistics (live serial mode only).
+        self.packet_count = 0          # packets received in the current 1 s window
+        self.last_seq = None           # last seen sequence id (packet index)
+        self.lost_packets = 0          # cumulative lost packets (seq gaps)
         self.fc_diag_last_message = "FC not initialized"
         self.fc_rpm = 0.0
         self.fc_telemetry_thread = None
@@ -493,6 +498,11 @@ class RealtimeVibeApp(QMainWindow):
         self.lsb_per_g = 256.0
 
         self.init_ui()
+
+        # Report incoming-data frequency and lost packets once per second.
+        self.packet_stats_timer = QTimer()
+        self.packet_stats_timer.timeout.connect(self.update_packet_stats)
+        self.packet_stats_timer.start(1000)
 
         if self.file_mode:
             # File mode: load bursts and show the first one
@@ -537,11 +547,17 @@ class RealtimeVibeApp(QMainWindow):
         self.cpu_stat_label = QLabel("CPU usage: 0%")
         statistics_layout.addWidget(self.cpu_stat_label, 6, 0, 1, 3)
 
+        # Incoming-data frequency (packets per second) and lost-packet count.
+        self.packet_freq_label = QLabel("Incoming frequency: 0 Hz")
+        statistics_layout.addWidget(self.packet_freq_label, 7, 0, 1, 3)
+        self.lost_packets_label = QLabel("Lost packets: 0")
+        statistics_layout.addWidget(self.lost_packets_label, 8, 0, 1, 3)
+
         # Burst metadata (file mode only)
         self.burst_info_label = QLabel("")
         self.burst_info_label.setWordWrap(True)
         statistics_layout.addWidget(self.burst_info_label, 5, 0, 1, 3)
-        statistics_layout.addWidget(QLabel(""), 8, 0, 1, 3)
+        statistics_layout.addWidget(QLabel(""), 9, 0, 1, 3)
 
         settings_box = QGroupBox("Settings")
         settings_box.setStyleSheet(
@@ -799,10 +815,26 @@ class RealtimeVibeApp(QMainWindow):
         self.plots_fft[2].setXLink(self.plots_fft[0])
 
     def handle_sample(self, sid, seq, x, y, z):
-        if sid == 0: 
+        # Every incoming line counts toward the incoming-data frequency.
+        self.packet_count += 1
+        if sid == 0:
+            # Lost-packet detection: the sequence id should increase by exactly 1.
+            if self.last_seq is not None:
+                gap = seq - self.last_seq
+                if gap > 1:
+                    # A gap means packets were dropped on the way.
+                    self.lost_packets += gap - 1
+                # gap <= 0 means the sequence rewound (e.g. reconnect); ignore.
+            self.last_seq = seq
             self.buf_x.append(x)
             self.buf_y.append(y)
             self.buf_z.append(z)
+
+    def update_packet_stats(self):
+        # Called once per second: report the packet rate, then restart the window.
+        self.packet_freq_label.setText(f"Incoming frequency: {self.packet_count} Hz")
+        self.lost_packets_label.setText(f"Lost packets: {self.lost_packets}")
+        self.packet_count = 0
 
     def generate_demo_bursts(self):
         # Build synthetic bursts matching the DVB1 format (3200 Hz, 6400 samples)
