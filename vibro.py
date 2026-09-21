@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QPushButton, QSpinBox, QVBoxLayout, QWidget
 )
 import pyqtgraph as pg
+import pyqtgraph.exporters as pg_exporters
 
 # === CONFIGURATION ===
 BAUD_RATE = 921600
@@ -326,11 +327,12 @@ class FCTelemetryReader(QThread):
     MSP_MOTOR_TELEMETRY = 139
     MOTOR_RECORD_SIZE = 13
 
-    def __init__(self, serial_port):
+    def __init__(self, serial_port, motor_channel=3):
         super().__init__()
         self.ser = serial_port
         self.running = True
         self.buffer = bytearray()
+        self.motor_channel = max(1, int(motor_channel))
 
     @classmethod
     def _build_request(cls):
@@ -361,14 +363,16 @@ class FCTelemetryReader(QThread):
         return None
 
     @classmethod
-    def _parse_motor_3_rpm(cls, payload):
+    def _parse_motor_rpm(cls, payload, motor_channel):
         if not payload:
             return None
         motor_count = payload[0]
-        motor_offset = 1 + 2 * cls.MOTOR_RECORD_SIZE
-        if motor_count < 3 or len(payload) < motor_offset + 4:
+        if motor_channel < 1 or motor_count < motor_channel:
             return None
-        return struct.unpack_from("<I", payload, 1 + 2 * cls.MOTOR_RECORD_SIZE)[0]
+        motor_offset = 1 + (motor_channel - 1) * cls.MOTOR_RECORD_SIZE
+        if len(payload) < motor_offset + 4:
+            return None
+        return struct.unpack_from("<I", payload, motor_offset)[0]
 
     def run(self):
         next_request = 0.0
@@ -383,7 +387,7 @@ class FCTelemetryReader(QThread):
                     self.buffer.extend(self.ser.read(self.ser.in_waiting))
                     payload = self._parse_packet(self.buffer)
                     while payload is not None:
-                        rpm_value = self._parse_motor_3_rpm(payload)
+                        rpm_value = self._parse_motor_rpm(payload, self.motor_channel)
                         if rpm_value is not None:
                             self.rpm_updated.emit(float(rpm_value))
                         payload = self._parse_packet(self.buffer)
@@ -395,6 +399,9 @@ class FCTelemetryReader(QThread):
     def stop(self):
         self.running = False
         self.wait(500)
+
+    def set_motor_channel(self, motor_channel):
+        self.motor_channel = max(1, int(motor_channel))
 
 
 class FFTWorker(QThread):
@@ -676,6 +683,17 @@ class RealtimeVibeApp(QMainWindow):
         esc_layout.addWidget(self.fc_status_label)
         self.fc_diag_label = QLabel("FC diag: not initialized")
         esc_layout.addWidget(self.fc_diag_label)
+
+        rpm_channel_label = QLabel("RPM motor channel:")
+        esc_layout.addWidget(rpm_channel_label)
+        self.rpm_motor_channel_input = QSpinBox()
+        self.rpm_motor_channel_input.setRange(1, 16)
+        self.rpm_motor_channel_input.setValue(3)
+        self.rpm_motor_channel_input.setSuffix(" (1-based)")
+        self.rpm_motor_channel_input.setFixedWidth(170)
+        self.rpm_motor_channel_input.valueChanged.connect(self.set_rpm_motor_channel)
+        esc_layout.addWidget(self.rpm_motor_channel_input)
+
         self.btn_esc_start = QPushButton("START")
         self.btn_esc_start.setFixedWidth(170)
         self.btn_esc_start.clicked.connect(self.start_esc)
@@ -741,7 +759,7 @@ class RealtimeVibeApp(QMainWindow):
         statistics_box.setFixedHeight(200)
         settings_box.setFixedHeight(200)
         action_box.setFixedHeight(200)
-        esc_box.setFixedHeight(200)
+        esc_box.setFixedHeight(250)
         esc_box.setFixedWidth(360)
 
         statistics_and_esc_layout = QHBoxLayout()
@@ -966,6 +984,11 @@ class RealtimeVibeApp(QMainWindow):
         hz_value = self.fc_rpm / 60.0
         self.update_fft_rpm_indicators(hz_value)
 
+    def set_rpm_motor_channel(self, motor_channel):
+        if self.fc_telemetry_thread is not None:
+            self.fc_telemetry_thread.set_motor_channel(motor_channel)
+        self.log_fc_diagnostic(f"RPM telemetry channel set to motor {motor_channel}.", "INFO")
+
     def update_fft_rpm_indicators(self, motor_hz):
         max_frequency = DVB1_SAMPLE_RATE / 2.0  # file-mode sensor rate cap
         frequencies = (float(motor_hz), float(motor_hz) * 2.0)
@@ -1142,16 +1165,25 @@ class RealtimeVibeApp(QMainWindow):
             self.fc_telemetry_thread.stop()
             self.fc_telemetry_thread = None
 
-        self.fc_telemetry_thread = FCTelemetryReader(self.fc_serial)
+        self.fc_telemetry_thread = FCTelemetryReader(
+            self.fc_serial,
+            self.rpm_motor_channel_input.value(),
+        )
         self.fc_telemetry_thread.rpm_updated.connect(self.handle_fc_rpm_update)
         self.fc_telemetry_thread.start()
 
     def reconnect_fc(self):
         if self.fc_serial is not None and self.fc_serial.is_open:
-            self.stop_esc()
-            self.fc_serial.close()
+            self._stop_ramp_active = False
+            if self.fc_telemetry_thread is not None:
+                self.fc_telemetry_thread.stop()
+                self.fc_telemetry_thread = None
+            self.send_motor_values([1000, 1000, 1000, 1000])
+            if self.fc_serial is not None and self.fc_serial.is_open:
+                self.fc_serial.close()
             self.fc_serial = None
             self.fc_port = None
+            self.esc_running = False
 
         dialog = PortDialog(
             title="Select Betaflight FC serial port",
@@ -1305,12 +1337,23 @@ class RealtimeVibeApp(QMainWindow):
             saved_name = os.path.basename(filename)
             message = f"{saved_name} saved"
 
-        exporter = pg.exporters.ImageExporter(self.graphics_layout.scene())
-        exporter.parameters()['width'] = 1920
-        exporter.export(filename)
+        try:
+            exporter = pg_exporters.ImageExporter(self.graphics_layout.scene())
+            exporter.parameters()['width'] = 1920
+            exporter.export(filename)
+        except Exception as error:
+            error_message = f"PNG export failed: {error}"
+            self.save_status_label.setStyleSheet(
+                "QLabel { color: #9b1c1c; font-size: 12px; }"
+            )
+            self.save_status_label.setText(error_message)
+            print(error_message)
+            return
 
-        if hasattr(self, "save_status_label"):
-            self.save_status_label.setText(message)
+        self.save_status_label.setStyleSheet(
+            "QLabel { color: #2d6b2d; font-size: 12px; }"
+        )
+        self.save_status_label.setText(message)
         print(f"Snapshot saved to {filename}")
 
     def closeEvent(self, event):
