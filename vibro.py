@@ -51,6 +51,8 @@ DVB1_LSB_TO_MS2 = 0.0039 * 9.80665              # ADXL345 8g mode: 3.9 mg/LSB
 FFT_MIN_HZ = 4.0                               # FFT display range
 FFT_MAX_FREQ_CHOICES = [200, 400, 600, 800, 1000, 1200, 1600]  # Hz, FFT max-frequency options
 DEFAULT_FFT_MAX_FREQ = 800.0                     # Hz, default FFT max frequency
+IMU_HZ_CHOICES = [800, 1000, 1600, 2000, 3200, 4000]  # Hz, IMU sample-rate options
+DEFAULT_IMU_HZ = 2000.0                          # Hz, default IMU sample rate
 
 
 def remove_gravity_component(axis_data):
@@ -464,12 +466,16 @@ class RealtimeVibeApp(QMainWindow):
         self.resize(1600, 900)
 
         self.time_window_seconds = 2.0
-        # FFT max frequency (Hz) also sets the live Nyquist: live_sample_rate = 2 * fft_max_freq.
+        # FFT max frequency (Hz) sets the live Nyquist for the FFT only:
+        # live_sample_rate = 2 * fft_max_freq.
         self.fft_max_freq = DEFAULT_FFT_MAX_FREQ
         self.live_sample_rate = 2.0 * self.fft_max_freq
-        self.buf_x = deque(maxlen=int(self.live_sample_rate * self.time_window_seconds))
-        self.buf_y = deque(maxlen=int(self.live_sample_rate * self.time_window_seconds))
-        self.buf_z = deque(maxlen=int(self.live_sample_rate * self.time_window_seconds))
+        # IMU sample rate (Hz) drives the time-domain ("Czasówki") graphs so they
+        # always show exactly time_window_seconds of real-time data.
+        self.imu_hz = DEFAULT_IMU_HZ
+        self.buf_x = deque(maxlen=int(self.imu_hz * self.time_window_seconds))
+        self.buf_y = deque(maxlen=int(self.imu_hz * self.time_window_seconds))
+        self.buf_z = deque(maxlen=int(self.imu_hz * self.time_window_seconds))
         self.time_axes = ['X', 'Y', 'Z']
         self.esp_port = serial_port
         self.demo_mode = demo_mode
@@ -621,6 +627,20 @@ class RealtimeVibeApp(QMainWindow):
         self.fft_max_freq_input.currentIndexChanged.connect(self.on_fft_max_freq_changed)
         settings_layout.addWidget(self.fft_max_freq_input)
 
+        # IMU sample-rate selector.  This drives the time-domain ("Czasówki")
+        # graphs so they always show exactly time_window_seconds of real-time
+        # data, independent of the FFT max frequency.
+        imu_hz_label = QLabel("IMU Hz:")
+        settings_layout.addWidget(imu_hz_label)
+
+        self.imu_hz_input = QComboBox()
+        self.imu_hz_input.setFixedWidth(200)
+        for _hz in IMU_HZ_CHOICES:
+            self.imu_hz_input.addItem(str(_hz), int(_hz))
+        self.imu_hz_input.setCurrentIndex(IMU_HZ_CHOICES.index(int(DEFAULT_IMU_HZ)))
+        self.imu_hz_input.currentIndexChanged.connect(self.on_imu_hz_changed)
+        settings_layout.addWidget(self.imu_hz_input)
+
         # Sensor sensitivity selector: choose the LSB/g converter for the
         # connected accelerometer. 256 = old ADXL345, 2048 = new sensor.
         sensor_label = QLabel("Sensor sensitivity:")
@@ -635,7 +655,7 @@ class RealtimeVibeApp(QMainWindow):
         settings_layout.addWidget(self.sensor_sensitivity_combo)
 
         settings_layout.addStretch(1)
-        settings_box.setFixedHeight(260)
+        settings_box.setFixedHeight(310)
         settings_box.setFixedWidth(220)
 
         action_box = QGroupBox("File")
@@ -973,9 +993,9 @@ class RealtimeVibeApp(QMainWindow):
             self.btn_zoom_timescale.setChecked(False)
             self.btn_zoom_timescale.setStyleSheet("")
 
-        self.buf_x = deque(self.buf_x, maxlen=int(FS * self.time_window_seconds))
-        self.buf_y = deque(self.buf_y, maxlen=int(FS * self.time_window_seconds))
-        self.buf_z = deque(self.buf_z, maxlen=int(FS * self.time_window_seconds))
+        self.buf_x = deque(self.buf_x, maxlen=int(self.imu_hz * self.time_window_seconds))
+        self.buf_y = deque(self.buf_y, maxlen=int(self.imu_hz * self.time_window_seconds))
+        self.buf_z = deque(self.buf_z, maxlen=int(self.imu_hz * self.time_window_seconds))
 
         self.update_plots()
 
@@ -1135,17 +1155,29 @@ class RealtimeVibeApp(QMainWindow):
     def set_fft_max_frequency(self, hz):
         # Set the FFT display max frequency (Hz) and the live sample rate used to
         # compute the FFT frequency axis. Nyquist = sample_rate / 2, so the live
-        # sample rate is twice the chosen max frequency.
+        # sample rate is twice the chosen max frequency.  This does NOT affect the
+        # time-domain ("Czasówki") graphs, which are driven by imu_hz.
         self.fft_max_freq = float(hz)
         self.live_sample_rate = 2.0 * self.fft_max_freq
-        # Rebuild the time-domain buffers so they still hold ~time_window_seconds.
-        self.buf_x = deque(maxlen=int(self.live_sample_rate * self.time_window_seconds))
-        self.buf_y = deque(maxlen=int(self.live_sample_rate * self.time_window_seconds))
-        self.buf_z = deque(maxlen=int(self.live_sample_rate * self.time_window_seconds))
         # Widen/shrink the FFT display range on all three axes if they exist.
         if hasattr(self, "plots_fft"):
             for p_fft in self.plots_fft:
                 p_fft.setXRange(FFT_MIN_HZ, self.fft_max_freq, padding=0)
+
+    def on_imu_hz_changed(self, index):
+        # Wrapper so the combo's currentIndexChanged delivers the stored value.
+        hz = int(self.imu_hz_input.currentData())
+        self.set_imu_hz(hz)
+
+    def set_imu_hz(self, hz):
+        # Set the IMU sample rate (Hz) that drives the time-domain ("Czasówki")
+        # graphs.  Rebuild the buffers so they still hold exactly
+        # time_window_seconds of real-time data.
+        self.imu_hz = float(hz)
+        self.buf_x = deque(self.buf_x, maxlen=int(self.imu_hz * self.time_window_seconds))
+        self.buf_y = deque(self.buf_y, maxlen=int(self.imu_hz * self.time_window_seconds))
+        self.buf_z = deque(self.buf_z, maxlen=int(self.imu_hz * self.time_window_seconds))
+        self.update_plots()
 
     def update_esc_power(self):
         if self.esc_running:
@@ -1274,7 +1306,9 @@ class RealtimeVibeApp(QMainWindow):
         data = [np.array(self.buf_x), np.array(self.buf_y), np.array(self.buf_z)]
         # Remove the constant gravity component so only vibration remains
         data = remove_gravity_component(data)
-        t = np.arange(len(data[0])) / self.live_sample_rate
+        # Time axis uses the IMU sample rate so the "Czasówki" graphs always show
+        # exactly time_window_seconds of real-time data.
+        t = np.arange(len(data[0])) / self.imu_hz
         self.average_stat_label.setText(
             f"Average vibration: {np.mean(np.abs(np.concatenate(data))):.1f} m/s²"
         )
