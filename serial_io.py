@@ -7,6 +7,7 @@ import time
 from PyQt6.QtCore import QThread, pyqtSignal
 
 import config
+import utils
 
 
 class SerialWorker(QThread):
@@ -30,8 +31,32 @@ class SerialWorker(QThread):
         self.buffer = bytearray()
 
     def run(self):
+        # Auto-reconnect loop: keep trying to (re)connect the ESP32 until the
+        # app asks us to stop. Each attempt re-scans for the preferred port so a
+        # replug that changed the COM number still reconnects.
+        while self.running:
+            if self._stream_once():
+                break  # connected and shut down cleanly (or stopped)
+            if self.running:
+                self._wait_before_retry()
+
+    def _wait_before_retry(self):
+        # Wait ~ESP_RECONNECT_INTERVAL_MS between attempts, but wake early if
+        # stop() is called so the app can close promptly.
+        waited = 0
+        while waited < config.ESP_RECONNECT_INTERVAL_MS and self.running:
+            self.msleep(100)
+            waited += 100
+
+    def _stream_once(self):
+        # Open the preferred port and stream until it drops. Returns True if we
+        # connected at least once (so the caller stops retrying), False if we
+        # never managed to open a port.
+        port = self._resolve_port()
+        if port is None:
+            return False
         try:
-            self.ser = serial.Serial(self.port, self.baudrate, timeout=0.1)
+            self.ser = serial.Serial(port, self.baudrate, timeout=0.1)
             self.ser.write(b"call all\n")
             time.sleep(3)
             self.ser.write(b"start stream\n")
@@ -76,8 +101,25 @@ class SerialWorker(QThread):
                 except Exception:
                     pass
                 self.ser.close()
+            return True
         except Exception as e:
             print(f"Serial error: {e}")
+            self._safe_close()
+            return False
+
+    def _resolve_port(self):
+        # Re-scan for the preferred CH340 device so a replug that changed the COM
+        # number still reconnects; fall back to the originally requested port.
+        preferred = utils.find_preferred_port()
+        return preferred if preferred else self.port
+
+    @staticmethod
+    def _safe_close():
+        try:
+            if self.ser and self.ser.is_open:
+                self.ser.close()
+        except Exception:
+            pass
 
     def stop(self):
         self.running = False

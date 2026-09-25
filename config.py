@@ -15,6 +15,7 @@ TIME_Y_MIN_RANGE = 2.0
 DEFAULT_FFT_REFRESH_HZ = 10.0
 FFT_UPDATE_INTERVAL = 1.0 / DEFAULT_FFT_REFRESH_HZ
 MAX_FFT_POINTS = 512
+ESP_RECONNECT_INTERVAL_MS = 1000   # wait between auto-reconnect attempts
 
 SEQ_LINE = re.compile(r"^S(\d),(\d+),(-?\d+),(-?\d+),(-?\d+)\s*$")
 PREFERRED_PORT_DESCRIPTION = "USB_SERIAL CH340"

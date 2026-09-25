@@ -147,7 +147,7 @@ class RealtimeVibeApp(QMainWindow):
         settings_layout.setContentsMargins(8, 12, 8, 8)
         settings_layout.setSpacing(6)
 
-        self.btn_reconnect_esp = QPushButton("Reconnect to esp")
+        self.btn_reconnect_esp = QPushButton("Reconnect to sensor")
         self.btn_reconnect_esp.clicked.connect(self.reconnect_esp)
         self.btn_reconnect_esp.setFixedWidth(200)
         settings_layout.addWidget(self.btn_reconnect_esp)
@@ -216,7 +216,7 @@ class RealtimeVibeApp(QMainWindow):
         self.sensor_sensitivity_combo = QComboBox()
         self.sensor_sensitivity_combo.addItem("256 (old ADXL345)", 256)
         self.sensor_sensitivity_combo.addItem("2048 (new sensor)", 2048)
-        self.sensor_sensitivity_combo.setCurrentIndex(0)
+        self.sensor_sensitivity_combo.setCurrentIndex(1)
         self.sensor_sensitivity_combo.setFixedWidth(200)
         self.sensor_sensitivity_combo.currentIndexChanged.connect(self.on_sensor_sensitivity_changed)
         settings_layout.addWidget(self.sensor_sensitivity_combo)
