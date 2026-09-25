@@ -11,7 +11,8 @@ import serial
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtWidgets import (
     QComboBox, QDialog, QDoubleSpinBox, QGridLayout, QGroupBox, QHBoxLayout,
-    QLabel, QLineEdit, QMainWindow, QPushButton, QSpinBox, QVBoxLayout, QWidget
+    QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QSpinBox,
+    QVBoxLayout, QWidget
 )
 import pyqtgraph as pg
 import pyqtgraph.exporters as pg_exporters
@@ -61,6 +62,7 @@ class RealtimeVibeApp(QMainWindow):
         self.packet_count = 0          # packets received in the current 1 s window
         self.last_seq = None           # last seen sequence id (packet index)
         self.lost_packets = 0          # cumulative lost packets (seq gaps)
+        self.lost_packets_warning_shown = False  # show the warning only once per session
         self.fc_diag_last_message = "FC not initialized"
         self.fc_rpm = 0.0
         self.fc_telemetry_thread = None
@@ -438,6 +440,33 @@ class RealtimeVibeApp(QMainWindow):
         self.packet_freq_label.setText(f"Incoming frequency: {self.packet_count} Hz")
         self.lost_packets_label.setText(f"Lost packets: {self.lost_packets}")
         self.packet_count = 0
+        # Highlight lost packets: red and bold when any packets were dropped.
+        if self.lost_packets > 0:
+            self.lost_packets_label.setStyleSheet(
+                "QLabel { color: #b00020; font-weight: bold; }"
+            )
+        else:
+            self.lost_packets_label.setStyleSheet("")
+
+        # Warn the user once per session the first time lost packets appear.
+        # The app keeps running; this is only an informational notice.
+        if self.lost_packets > 0 and not self.lost_packets_warning_shown:
+            self.lost_packets_warning_shown = True
+            self.show_lost_packets_warning()
+
+    def show_lost_packets_warning(self):
+        # One-time informational popup. The app keeps working normally; this
+        # just lets the user know the connection may be dropping packets.
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setWindowTitle("Lost packets detected")
+        msg.setText("Some sensor packets were lost during the connection.")
+        msg.setInformativeText(
+            "The app keeps running normally. This usually means the serial "
+            "connection dropped or is too slow. Check the cable and USB port"
+        )
+        msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+        msg.exec()
 
     def generate_demo_bursts(self):
         # Build synthetic bursts matching the DVB1 format (3200 Hz, 6400 samples)
