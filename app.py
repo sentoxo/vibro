@@ -904,6 +904,7 @@ class RealtimeVibeApp(QMainWindow):
         self.fft_cache[axis_index] = (freqs, amps)
         if len(freqs) > 0:
             self.curves_fft[axis_index].setData(freqs, amps)
+            self._expand_fft_y_range(axis_index, amps)
 
         fft_peaks = []
         for axis_idx in range(3):
@@ -919,6 +920,19 @@ class RealtimeVibeApp(QMainWindow):
 
         for peak_number, peak_label in enumerate(self.peak_stat_labels):
             peak_label.setText(self.format_peak_statistics(peak_number, fft_peaks))
+
+    def _expand_fft_y_range(self, axis_index, amplitudes):
+        # Recompute from the current FFT so the scale contracts after an impulse fades.
+        peak_amplitude = float(np.max(amplitudes))
+        y_max = config.FFT_Y_MAX
+        if peak_amplitude > y_max:
+            magnitude = 10.0 ** np.floor(np.log10(peak_amplitude))
+            y_max = next(
+                step * magnitude
+                for step in config.FFT_Y_SCALE_STEPS
+                if step * magnitude >= peak_amplitude
+            )
+        self.plots_fft[axis_index].setYRange(0, float(y_max), padding=0)
 
     def update_plots(self):
         if self.file_mode or self.demo_mode:
