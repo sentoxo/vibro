@@ -562,8 +562,11 @@ class RealtimeVibeApp(QMainWindow):
             self.plots_time[i].setTitle(
                 f"Czasówki - Oś {self.time_axes[i]} - {average_level:.2f} m/s² avg"
             )
+        # Combine the axis RMS values as a vector resultant, not a pooled mean.
+        rms_x, rms_y, rms_z = [np.sqrt(np.mean(axis_data ** 2)) for axis_data in data]
+        rms_total = np.sqrt(rms_x ** 2 + rms_y ** 2 + rms_z ** 2)
         self.average_stat_label.setText(
-            f"RMS vibration: {np.sqrt(np.mean(np.concatenate(data) ** 2)):.2f} m/s²"
+            f"RMS vibration: {rms_total:.2f} m/s²"
         )
 
         # Submit full burst for FFT (no MAX_FFT_POINTS downsampling for file mode)
@@ -903,8 +906,11 @@ class RealtimeVibeApp(QMainWindow):
         # Time axis uses the IMU sample rate so the "Czasówki" graphs always show
         # exactly time_window_seconds of real-time data.
         t = np.arange(len(data[0])) / self.imu_hz
+        # ISO-style resultant combines the three per-axis RMS values as a vector.
+        rms_x, rms_y, rms_z = [np.sqrt(np.mean(axis_data ** 2)) for axis_data in data]
+        rms_total = np.sqrt(rms_x ** 2 + rms_y ** 2 + rms_z ** 2)
         self.average_stat_label.setText(
-            f"RMS vibration: {np.sqrt(np.mean(np.concatenate(data) ** 2)):.2f} m/s²"
+            f"RMS vibration: {rms_total:.2f} m/s²"
         )
 
         # Sample CPU usage and show a smoothed average over recent samples.
