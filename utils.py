@@ -1,6 +1,7 @@
 # Pure helper functions: gravity removal, DVB1 burst parsing, port discovery.
 
 import struct
+import time
 
 import numpy as np
 from serial.tools import list_ports
@@ -55,6 +56,39 @@ def parse_dvb1_file(path):
         offset += config.DVB1_HEADER_SIZE + samples_bytes
 
     return bursts
+
+
+def write_dvb1_file(path, samples, sample_rate, timestamp_ns=None, sequence=0):
+    # Store physical acceleration values using the same scale the parser applies.
+    samples = np.asarray(samples, dtype=np.float64)
+    if samples.ndim != 2 or samples.shape[1] != 3:
+        raise ValueError("DVB1 snapshots must contain exactly three axes")
+    if not np.all(np.isfinite(samples)):
+        raise ValueError("DVB1 snapshot samples must be finite")
+
+    sample_rate = int(round(sample_rate))
+    if sample_rate <= 0:
+        raise ValueError("Sample rate must be positive")
+
+    raw_samples = np.rint(samples / config.DVB1_LSB_TO_MS2)
+    raw_samples = np.clip(raw_samples, -32768, 32767).astype("<i2")
+    timestamp_ns = time.time_ns() if timestamp_ns is None else int(timestamp_ns)
+    header = (
+        config.DVB1_MAGIC
+        + struct.pack(
+            "<HHIIQQ",
+            1,
+            3,
+            sample_rate,
+            len(raw_samples),
+            timestamp_ns,
+            int(sequence),
+        )
+    )
+
+    with open(path, "wb") as file:
+        file.write(header)
+        file.write(raw_samples.tobytes(order="C"))
 
 
 def find_preferred_port():

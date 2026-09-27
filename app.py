@@ -42,6 +42,11 @@ class RealtimeVibeApp(QMainWindow):
         self.buf_x = deque(maxlen=int(self.imu_hz * self.time_window_seconds))
         self.buf_y = deque(maxlen=int(self.imu_hz * self.time_window_seconds))
         self.buf_z = deque(maxlen=int(self.imu_hz * self.time_window_seconds))
+        # Keep a fixed two-second history even when the plot is zoomed in.
+        snapshot_buffer_size = int(self.imu_hz * 2.0)
+        self.snapshot_buf_x = deque(maxlen=snapshot_buffer_size)
+        self.snapshot_buf_y = deque(maxlen=snapshot_buffer_size)
+        self.snapshot_buf_z = deque(maxlen=snapshot_buffer_size)
         self.time_axes = ['X', 'Y', 'Z']
         self.esp_port = serial_port
         self.demo_mode = demo_mode
@@ -234,7 +239,7 @@ class RealtimeVibeApp(QMainWindow):
         action_layout.setSpacing(6)
 
         self.filename_input = QLineEdit()
-        self.filename_input.setPlaceholderText("PNG file name")
+        self.filename_input.setPlaceholderText("File name")
         self.filename_input.setFixedWidth(220)
         action_layout.addWidget(self.filename_input)
 
@@ -244,10 +249,20 @@ class RealtimeVibeApp(QMainWindow):
         self.filename_index_input.setFixedWidth(220)
         action_layout.addWidget(self.filename_index_input)
 
-        self.btn_save = QPushButton("Save PNG Snapshot")
+        self.btn_save = QPushButton("Save PNG")
         self.btn_save.clicked.connect(self.save_png)
         self.btn_save.setFixedWidth(220)
         action_layout.addWidget(self.btn_save)
+
+        self.btn_save_snapshot = QPushButton("Save snapshot")
+        self.btn_save_snapshot.clicked.connect(self.save_snapshot)
+        self.btn_save_snapshot.setFixedWidth(220)
+        action_layout.addWidget(self.btn_save_snapshot)
+
+        self.btn_save_both = QPushButton("Save PNG and snapshot")
+        self.btn_save_both.clicked.connect(self.save_png_and_snapshot)
+        self.btn_save_both.setFixedWidth(220)
+        action_layout.addWidget(self.btn_save_both)
 
         self.save_status_label = QLabel("")
         self.save_status_label.setWordWrap(True)
@@ -256,7 +271,7 @@ class RealtimeVibeApp(QMainWindow):
         action_layout.addWidget(self.save_status_label)
 
         action_layout.addStretch(1)
-        action_box.setFixedHeight(200)
+        action_box.setFixedHeight(250)
         action_box.setFixedWidth(260)
 
         esc_box = QGroupBox("ESC control")
@@ -434,6 +449,9 @@ class RealtimeVibeApp(QMainWindow):
             self.buf_x.append(x)
             self.buf_y.append(y)
             self.buf_z.append(z)
+            self.snapshot_buf_x.append(x)
+            self.snapshot_buf_y.append(y)
+            self.snapshot_buf_z.append(z)
 
     def update_packet_stats(self):
         # Called once per second: report the packet rate, then restart the window.
@@ -593,6 +611,10 @@ class RealtimeVibeApp(QMainWindow):
         self.buf_x = deque(self.buf_x, maxlen=int(self.imu_hz * self.time_window_seconds))
         self.buf_y = deque(self.buf_y, maxlen=int(self.imu_hz * self.time_window_seconds))
         self.buf_z = deque(self.buf_z, maxlen=int(self.imu_hz * self.time_window_seconds))
+        snapshot_buffer_size = int(self.imu_hz * 2.0)
+        self.snapshot_buf_x = deque(self.snapshot_buf_x, maxlen=snapshot_buffer_size)
+        self.snapshot_buf_y = deque(self.snapshot_buf_y, maxlen=snapshot_buffer_size)
+        self.snapshot_buf_z = deque(self.snapshot_buf_z, maxlen=snapshot_buffer_size)
 
         self.update_plots()
 
@@ -774,6 +796,10 @@ class RealtimeVibeApp(QMainWindow):
         self.buf_x = deque(self.buf_x, maxlen=int(self.imu_hz * self.time_window_seconds))
         self.buf_y = deque(self.buf_y, maxlen=int(self.imu_hz * self.time_window_seconds))
         self.buf_z = deque(self.buf_z, maxlen=int(self.imu_hz * self.time_window_seconds))
+        snapshot_buffer_size = int(self.imu_hz * 2.0)
+        self.snapshot_buf_x = deque(self.snapshot_buf_x, maxlen=snapshot_buffer_size)
+        self.snapshot_buf_y = deque(self.snapshot_buf_y, maxlen=snapshot_buffer_size)
+        self.snapshot_buf_z = deque(self.snapshot_buf_z, maxlen=snapshot_buffer_size)
         self.update_plots()
 
     def update_esc_power(self):
@@ -895,7 +921,7 @@ class RealtimeVibeApp(QMainWindow):
             peak_label.setText(self.format_peak_statistics(peak_number, fft_peaks))
 
     def update_plots(self):
-        if self.file_mode:
+        if self.file_mode or self.demo_mode:
             return  # file mode plots are drawn once per burst
         if len(self.buf_x) < 64:
             return
@@ -945,7 +971,7 @@ class RealtimeVibeApp(QMainWindow):
             for i in range(3):
                 self.fft_worker.submit(i, data[i], self.live_sample_rate)
 
-    def save_png(self):
+    def _output_path(self, extension, collision_extensions=None):
         log_dir = os.path.join(os.getcwd(), "logs")
         os.makedirs(log_dir, exist_ok=True)
 
@@ -958,43 +984,122 @@ class RealtimeVibeApp(QMainWindow):
 
         power_level = int(round(self.get_esc_power_value()))
         index_value = int(self.filename_index_input.value())
-        requested_name = f"{base_name}{index_value:02d}_{power_level}.png"
+        stem = f"{base_name}{index_value:02d}_{power_level}"
+        original_stem = stem
+        extensions = collision_extensions or [extension]
+        candidate = os.path.join(log_dir, stem)
+        counter = 2
+        while any(os.path.exists(candidate + ext) for ext in extensions):
+            stem = f"{original_stem}_{counter:02d}"
+            candidate = os.path.join(log_dir, stem)
+            counter += 1
+        return candidate + extension, os.path.basename(candidate)
 
-        filename = os.path.join(log_dir, requested_name)
-        original_name = os.path.basename(filename)
-        if os.path.exists(filename):
-            base_name_only, ext = os.path.splitext(filename)
-            counter = 2
-            while True:
-                new_name = f"{base_name_only}_{counter:02d}{ext}"
-                if not os.path.exists(new_name):
-                    filename = new_name
-                    break
-                counter += 1
-            saved_name = os.path.basename(filename)
-            message = f"{original_name} exists already, saved as {saved_name}"
+    def _export_png(self, filename):
+        exporter = pg_exporters.ImageExporter(self.graphics_layout.scene())
+        exporter.parameters()['width'] = 1920
+        exporter.export(filename)
+
+    def _snapshot_data(self):
+        if self.file_mode:
+            if not self.file_bursts:
+                raise ValueError("No burst is loaded")
+            burst = self.file_bursts[self.current_burst_index]
+            sample_rate = float(burst["sample_rate"] or config.DVB1_SAMPLE_RATE)
+            samples = np.asarray(burst["samples"], dtype=np.float64)
+            sample_count = int(round(sample_rate * 2.0))
+            if len(samples) < sample_count:
+                raise ValueError("The selected burst contains less than 2 seconds of data")
+            samples = samples[-sample_count:]
+            skipped_samples = int(burst["sample_count"]) - sample_count
+            timestamp_ns = int(burst["timestamp_ns"] + skipped_samples / sample_rate * 1e9)
+            sequence = int(burst["sequence"])
         else:
-            saved_name = os.path.basename(filename)
-            message = f"{saved_name} saved"
+            sample_rate = self.imu_hz
+            sample_count = int(round(sample_rate * 2.0))
+            if len(self.snapshot_buf_x) < sample_count:
+                available_seconds = len(self.snapshot_buf_x) / sample_rate
+                raise ValueError(
+                    f"Waiting for 2 seconds of data ({available_seconds:.1f} seconds available)"
+                )
+            samples = np.column_stack((
+                self.snapshot_buf_x,
+                self.snapshot_buf_y,
+                self.snapshot_buf_z,
+            ))
+            timestamp_ns = time.time_ns() - 2_000_000_000
+            sequence = int(self.last_seq or 0)
+        return samples, sample_rate, timestamp_ns, sequence
+
+    def _set_save_status(self, message, success):
+        color = "#2d6b2d" if success else "#9b1c1c"
+        self.save_status_label.setStyleSheet(
+            f"QLabel {{ color: {color}; font-size: 12px; }}"
+        )
+        self.save_status_label.setText(message)
+
+    def save_png(self):
+        filename, stem = self._output_path(".png")
 
         try:
-            exporter = pg_exporters.ImageExporter(self.graphics_layout.scene())
-            exporter.parameters()['width'] = 1920
-            exporter.export(filename)
+            self._export_png(filename)
         except Exception as error:
             error_message = f"PNG export failed: {error}"
-            self.save_status_label.setStyleSheet(
-                "QLabel { color: #9b1c1c; font-size: 12px; }"
-            )
-            self.save_status_label.setText(error_message)
+            self._set_save_status(error_message, False)
             print(error_message)
             return
 
-        self.save_status_label.setStyleSheet(
-            "QLabel { color: #2d6b2d; font-size: 12px; }"
-        )
-        self.save_status_label.setText(message)
+        message = f"{stem}.png saved"
+        self._set_save_status(message, True)
         print(f"Snapshot saved to {filename}")
+
+    def save_snapshot(self):
+        try:
+            samples, sample_rate, timestamp_ns, sequence = self._snapshot_data()
+            filename, stem = self._output_path(".bin")
+            utils.write_dvb1_file(
+                filename, samples, sample_rate, timestamp_ns, sequence
+            )
+        except Exception as error:
+            error_message = f"Snapshot save failed: {error}"
+            self._set_save_status(error_message, False)
+            print(error_message)
+            return
+
+        self._set_save_status(f"{stem}.bin saved (2 seconds)", True)
+        print(f"Snapshot saved to {filename}")
+
+    def save_png_and_snapshot(self):
+        try:
+            samples, sample_rate, timestamp_ns, sequence = self._snapshot_data()
+            png_path, stem = self._output_path(".png", [".png", ".bin"])
+            bin_path = os.path.splitext(png_path)[0] + ".bin"
+        except Exception as error:
+            error_message = f"Snapshot preparation failed: {error}"
+            self._set_save_status(error_message, False)
+            print(error_message)
+            return
+
+        failures = []
+        try:
+            self._export_png(png_path)
+        except Exception as error:
+            failures.append(f"PNG failed: {error}")
+        try:
+            utils.write_dvb1_file(
+                bin_path, samples, sample_rate, timestamp_ns, sequence
+            )
+        except Exception as error:
+            failures.append(f"snapshot failed: {error}")
+
+        if failures:
+            message = f"Partial save ({stem}): {'; '.join(failures)}"
+            self._set_save_status(message, False)
+            print(message)
+            return
+
+        self._set_save_status(f"{stem}.png and {stem}.bin saved", True)
+        print(f"PNG and snapshot saved to {png_path} and {bin_path}")
 
     def closeEvent(self, event):
         self.timer.stop()
