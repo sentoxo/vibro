@@ -114,7 +114,7 @@ class RealtimeVibeApp(QMainWindow):
         statistics_layout = QGridLayout(statistics_box)
         statistics_layout.setContentsMargins(8, 12, 8, 8)
         statistics_layout.setVerticalSpacing(4)
-        self.average_stat_label = QLabel("Average vibration: 0.0 m/s²")
+        self.average_stat_label = QLabel("RMS vibration: 0.0 m/s²")
         statistics_layout.addWidget(self.average_stat_label, 0, 0, 1, 3)
         statistics_layout.addWidget(QLabel("Dominant FFT Peaks"), 1, 0, 1, 3)
         self.peak_stat_labels = []
@@ -373,7 +373,7 @@ class RealtimeVibeApp(QMainWindow):
         for i, axis in enumerate(self.time_axes):
             # Time Plot
             p_time = self.graphics_layout.addPlot(
-                title=f"Czasówki - Oś {axis} - 0.0 m/s² avg"
+                title=f"Czasówki - Oś {axis} - 0.00 m/s² rms"
             )
             p_time.showGrid(x=True, y=True)
             p_time.setLabel('left', '[m/s²]')
@@ -558,12 +558,12 @@ class RealtimeVibeApp(QMainWindow):
             time_y_limit = max(config.TIME_Y_MIN_RANGE / 2, np.max(np.abs(data[i])) * 1.1)
             self.plots_time[i].setYRange(-time_y_limit, time_y_limit, padding=0)
             self.plots_time[i].setXRange(0, count / self.current_fs, padding=0)
-            average_level = np.mean(np.abs(data[i]))
+            average_level = np.sqrt(np.mean(data[i] ** 2))
             self.plots_time[i].setTitle(
-                f"Czasówki - Oś {self.time_axes[i]} - {average_level:.1f} m/s² avg"
+                f"Czasówki - Oś {self.time_axes[i]} - {average_level:.2f} m/s² avg"
             )
         self.average_stat_label.setText(
-            f"Average vibration: {np.mean(np.abs(np.concatenate(data))):.1f} m/s²"
+            f"RMS vibration: {np.sqrt(np.mean(np.concatenate(data) ** 2)):.2f} m/s²"
         )
 
         # Submit full burst for FFT (no MAX_FFT_POINTS downsampling for file mode)
@@ -904,7 +904,7 @@ class RealtimeVibeApp(QMainWindow):
         # exactly time_window_seconds of real-time data.
         t = np.arange(len(data[0])) / self.imu_hz
         self.average_stat_label.setText(
-            f"Average vibration: {np.mean(np.abs(np.concatenate(data))):.1f} m/s²"
+            f"RMS vibration: {np.sqrt(np.mean(np.concatenate(data) ** 2)):.2f} m/s²"
         )
 
         # Sample CPU usage and show a smoothed average over recent samples.
@@ -926,9 +926,9 @@ class RealtimeVibeApp(QMainWindow):
             )
             self.plots_time[i].setYRange(-time_y_limit, time_y_limit, padding=0)
             self.plots_time[i].setXRange(0, self.time_window_seconds, padding=0)
-            average_level = np.mean(np.abs(data[i]))
+            average_level = np.sqrt(np.mean(data[i] ** 2))
             self.plots_time[i].setTitle(
-                f"Czasówki - Oś {self.time_axes[i]} - {average_level:.1f} m/s² avg"
+                f"Czasówki - Oś {self.time_axes[i]} - {average_level:.2f} m/s² rms"
             )
 
         now = time.perf_counter()
