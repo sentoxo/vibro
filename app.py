@@ -75,7 +75,7 @@ class RealtimeVibeApp(QMainWindow):
         self.fft_update_interval = config.FFT_UPDATE_INTERVAL
         # Default to the old ADXL345 (256 LSB/g). Changed via the Settings
         # dropdown; also applied live to a running serial worker.
-        self.lsb_per_g = 256.0
+        self.lsb_per_g = 2048.0
 
         self.init_ui()
 
@@ -173,7 +173,7 @@ class RealtimeVibeApp(QMainWindow):
         settings_layout.addWidget(refresh_label)
 
         self.fft_refresh_input = QDoubleSpinBox()
-        self.fft_refresh_input.setRange(1.0, 30.0)
+        self.fft_refresh_input.setRange(0.5, 60.0)
         self.fft_refresh_input.setDecimals(1)
         self.fft_refresh_input.setSingleStep(0.5)
         self.fft_refresh_input.setSuffix(" Hz")
@@ -911,6 +911,12 @@ class RealtimeVibeApp(QMainWindow):
         self.cpu_history.append(max(0.0, min(100.0, self.process.cpu_percent())))
         average_cpu_usage = np.mean(self.cpu_history)
         self.cpu_stat_label.setText(f"CPU usage: {average_cpu_usage:.0f}%")
+        if average_cpu_usage > 97:
+            self.cpu_stat_label.setStyleSheet(
+                "QLabel { color: #b00020; font-weight: bold; }"
+            )
+        else:
+            self.cpu_stat_label.setStyleSheet("")
 
         for i in range(3):
             self.curves_time[i].setData(t, data[i])
