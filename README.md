@@ -2,14 +2,16 @@
 
 ![VibroApp](imager.png)
 
-Real-time vibration monitor for ESP32 sensor data with live time-domain and FFT plots for X, Y, and Z axes. AI generated code.
+Real-time vibration monitor for sensor data with live time-domain and FFT plots for X, Y, and Z axes. AI generated code.
 
 ## Features
-- Reads vibration data from a connected ESP32 over serial
+- Reads vibration data from a connected sensor over serial
+- Counts data packets and warns the user in the event of packet loss.
 - Shows live waveform and FFT charts for all three axes
-- Displays average vibration and dominant FFT peaks
-- Supports calibration and PNG snapshot export
+- Displays RMS vibration and dominant FFT peaks
+- Auto reconnect to sensor.
 - Provides basic ESC power control for FC-connected motors
+- Saves snapshot of data to files or/and screenshot snapshot of graphs
 
 ## Requirements
 - Python 3.10+
@@ -31,7 +33,7 @@ pip install PyQt6 pyqtgraph numpy psutil pyserial
 python vibro.py
 ```
 
-If the ESP32 port is not detected automatically, the app will ask you to select the serial port manually.
+If the sensor port is not detected automatically, the app will ask you to select the serial port manually.
 
 ### File mode
 
@@ -67,4 +69,5 @@ The code is split into small modules by concern. `vibro.py` is the only entry po
 ## Notes
 - The app expects ESP32 data in the format used by this project.
 - FFT processing is handled in a worker thread to reduce UI lag.
+- Each FFT axis scales independently from its current spectrum, with a minimum range of 0–2 m/s².
 - ESC control is intended for testing and should be used carefully.

@@ -69,3 +69,4 @@ sensor data with live time-domain and FFT plots, plus ESC/Betaflight FC control.
 - Confirm all modules still import: `python -c "import config, utils, dialogs, serial_io, esc_telemetry, fft_worker, app"`.
 - Confirm `python vibro.py --help` runs.
 - If you changed behavior, tell the user exactly what changed and why.
+- If there is new feature add it to readme.md
