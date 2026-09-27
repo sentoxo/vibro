@@ -35,6 +35,27 @@ python vibro.py
 
 If the sensor port is not detected automatically, the app will ask you to select the serial port manually.
 
+### Check for updates
+
+The startup **Select mode** window has a **Check for updates** button beneath the binary-file input. It checks the latest stable GitHub release without blocking the UI. If a newer version is found, you can approve a fast-forward-only `git pull`; after a successful update, close the dialog and restart VibroApp.
+
+Automatic updates require all of the following:
+- VibroApp was installed by cloning `https://github.com/sentoxo/vibro.git` (not by downloading a ZIP).
+- Git is installed and available on `PATH`.
+- The clone is on the `main` branch, its `origin` points to the project repository, and it has no local or untracked changes.
+- The app can reach GitHub. No GitHub login is needed for the public repository.
+
+If the clone has local changes, commit, stash, or back them up before updating. Updates use `git pull --ff-only origin main`; they will not overwrite changes or create a merge commit. On failure, the app reports the Git error and leaves the dialog open.
+
+#### Publishing an update
+
+The installed version is `0.1.0` (beta). To publish a later stable version:
+1. Update `APP_VERSION` in `config.py` and merge the tested release commit into `main`.
+2. Create a GitHub Release with a matching stable tag such as `v0.1.1`, from a commit already on `main`.
+3. Ensure `main` contains the complete release before publishing. The app checks the latest stable release tag, then pulls `main`, so the release commit must be reachable from `main`.
+
+The updater checks GitHub's latest stable release; prereleases are not offered. Until the first stable GitHub Release exists, the update check will report that no stable release was found.
+
 ### File mode
 
 Open a binary burst file (DVB1) instead of asking for a mode:
@@ -63,6 +84,7 @@ The code is split into small modules by concern. `vibro.py` is the only entry po
 | `serial_io.py` | `SerialWorker` thread: reads ESC32 burst lines |
 | `esc_telemetry.py` | `FCTelemetryReader` thread: Betaflight motor-RPM telemetry |
 | `fft_worker.py` | `FFTWorker` thread: amplitude spectra for submitted chunks |
+| `updater.py` | GitHub release checks and guarded Git fast-forward updates |
 | `app.py` | `RealtimeVibeApp` orchestrator (UI + plotting + threads) |
 | `vibro.py` | Entry point: argument parsing and app startup |
 

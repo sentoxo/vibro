@@ -4,6 +4,10 @@
 import re
 
 # === CONFIGURATION ===
+APP_VERSION = "0.1.0"
+GITHUB_REPOSITORY = "sentoxo/vibro"
+UPDATE_REMOTE = "origin"
+UPDATE_BRANCH = "main"
 BAUD_RATE = 921600
 FC_BAUD_RATE = 115200
 FS = 800.0
